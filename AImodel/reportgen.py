@@ -125,7 +125,7 @@ def parse_nmap_xml(xml_file, output_file):
 
 if __name__ == "__main__":
     # Specify the full paths for input and output files
-    xml_input_file = "output/scanout.xml"  # Input XML file location
+    xml_input_file = "/home/arunexploit/Penturion/AImodel/output/initial_scan.xml"  # Input XML file location
     text_output_file = "output/nmap_report.txt"  # Output text file location
 
     parse_nmap_xml(xml_input_file, text_output_file)

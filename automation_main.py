@@ -60,7 +60,7 @@ def get_domain_for_ip(ip, json_file_path):
 
 if __name__ == "__main__":
     print_banner()
-    DEBUG_MODE = True # Set to True for debugging, False for production
+    DEBUG_MODE = False # Set to True for debugging, False for production
     if not DEBUG_MODE:
         try:
             print(Fore.GREEN + Style.BRIGHT + "\n [*] (main2.py)NMAP SCANING  processing .......\n")
@@ -84,21 +84,23 @@ if __name__ == "__main__":
         if not target_domain:
             print(Fore.YELLOW + Style.BRIGHT + f" [!] No domain name found for IP {target_ip} in result.json. Skipping subdomain scan.")
         else:
-            os.makedirs("output", exist_ok=True)
-            print(Fore.GREEN + Style.BRIGHT + f"\n [*] (subbrute.py) processing against domain: {target_domain}\n")
+            print(Fore.CYAN + Style.BRIGHT + f"[*] Found domain '{target_domain}' for IP {target_ip}. Running subdomain scan...")
+    
+    
+            try:
+                command = ["/home/arunexploit/Penturion/inbuilt_Tool/recon/recon", "scan", "--domain", target_domain]
+                result = subprocess.run(command, capture_output=True, text=True, check=True)
+                print(Fore.GREEN + "[+] Subdomain scan completed.\n")
+                print(result.stdout)
 
-            # Run subbrute.py
-            subprocess.run([
-             "python3",
-             "inbuilt_Tool/subbrute/subbrute.py",
-             "-o", "output/subbrute_output.txt",
-            "cyfotok.com"  # Positional argument — the target domain
-            ])
-
-
-            print(Fore.GREEN + Style.BRIGHT + "\n [*] (subbrute.py) completed successfully!\n")
-
-    except FileNotFoundError:
-        print(Fore.RED + Style.BRIGHT + " [!] File 'output/penturion_target.txt' not found.")
+            except subprocess.CalledProcessError as e:
+                print(Fore.RED + f"[!] Error during subdomain scan:\n{e.stderr}")
+    #except FileNotFoundError:
+       # print(Fore.RED + Style.BRIGHT + " [!] Error: output/penturion_target.txt not found. Please ensure the file exists and contains a valid target IP.")
+    #except json.JSONDecodeError:
+        #print(Fore.RED + Style.BRIGHT + " [!] Error: output/result.json is not a valid JSON file or is corrupted.")
     except Exception as e:
-        print(Fore.RED + Style.BRIGHT + f" [!] Error: {e}")
+        print(Fore.RED + Style.BRIGHT + f" [!] An unexpected error occurred: {e}")
+    print(Fore.MAGENTA + Style.BRIGHT + "\n [*] Pentesting automation completed. Check the output directory for results.\n")
+    print(Fore.MAGENTA + Style.BRIGHT + "-" * 65 + Style.RESET_ALL)
+    print(Fore.YELLOW + Style.BRIGHT + " [*] Thank you for using the Automated Web Pentesting Framework! \n")

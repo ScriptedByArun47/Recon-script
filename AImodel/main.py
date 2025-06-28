@@ -1,4 +1,4 @@
-# Version 3.1 - add penturion target ip in txt file  
+# Version 3.2 - add penturion target ip in txt file  
 
 import json
 import os
@@ -466,7 +466,7 @@ def _convert_xml_host_to_json_dict(host_elem):
     
     # Hostnames
     hostnames_elem = host_elem.find('hostnames')
-    if hostnames_elem:
+    if hostnames_elem is not None:
         host_json['hostnames'] = []
         for hostname_elem in hostnames_elem.findall('hostname'):
             host_json['hostnames'].append({
@@ -476,7 +476,7 @@ def _convert_xml_host_to_json_dict(host_elem):
 
     # Ports
     ports_elem = host_elem.find('ports')
-    if ports_elem:
+    if ports_elem is not None:
         host_json['ports'] = {'port': []} # Ensure 'port' is always a list for consistency
         for port_elem in ports_elem.findall('port'):
             port_info = {
@@ -501,7 +501,7 @@ def _convert_xml_host_to_json_dict(host_elem):
     
     # OS Detection
     os_elem = host_elem.find('os')
-    if os_elem:
+    if os_elem is not None :
         os_matches = os_elem.findall('osmatch')
         if os_matches:
             host_json['os'] = {'osmatch': []}
@@ -527,7 +527,7 @@ def _convert_xml_host_to_json_dict(host_elem):
     
     # Hostscript results
     hostscript_elem = host_elem.find('hostscript')
-    if hostscript_elem:
+    if hostscript_elem is not None:
         host_json['hostscript'] = []
         for script_elem in hostscript_elem.findall('script'):
             host_json['hostscript'].append({
@@ -612,11 +612,11 @@ def parse_nmap_xml_report(xml_raw_data, target_ip_hint=None):
                     elif protocol == 'udp':
                         open_udp_ports.append(port_id)
                     
-                    if service_name:
+                    if service_name is not None:
                         known_services.append(service_name)
-                    if service_product:
+                    if service_product is not None:
                         facts.add_fact(f"service_product_{port_id}", service_product)
-                    if service_version:
+                    if service_version is not None:
                         facts.add_fact(f"service_version_{port_id}", service_version)
         
         facts.add_fact('open_tcp_ports', sorted(list(set(open_tcp_ports))))
@@ -644,7 +644,7 @@ def parse_nmap_xml_report(xml_raw_data, target_ip_hint=None):
         
         # Host Script Results (NSE)
         hostscript_elem = target_host_elem.find('hostscript')
-        if hostscript_elem:
+        if hostscript_elem is not None:
             script_results = {}
             for script_elem in hostscript_elem.findall('script'):
                 script_id = script_elem.get('id')

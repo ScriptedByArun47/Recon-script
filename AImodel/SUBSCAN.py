@@ -13,65 +13,53 @@ import xml.etree.ElementTree as ET # Import for potential XML validation
 # -O: OS detection
 # -sC: Default scripts (equivalent to --script=default)
 # -T4: Aggressive timing template
-# --top-ports 1000: Scans the 1000 most common ports
+# -p-: Scans all ports (1-65535) - CHANGED FROM --top-ports 1000
 # --traceroute: Performs a traceroute to the target
 # --reason: Displays the reason a port is in a particular state
 # --version-intensity 9: Sets version scan intensity to 9 (more aggressive)
-INITIAL_NMAP_ARGS = "-sS -sV -O -sC -T4 --top-ports 1000 --traceroute --reason --version-intensity 9"
+INITIAL_NMAP_ARGS = "-sS -sV -O -sC -T4 -p- --traceroute --reason --version-intensity 9"
 
 def run_nmap_scan(target_ip, output_file="scanout.xml"):
     """
     Runs a basic Nmap scan and outputs results to an XML file.
     Ensures the output directory exists before running Nmap.
     """
-    print(f"[{os.path.basename(__file__)}] Starting Nmap scan for {target_ip}...")
+    print(f"[{os.path.basename(__file__)}] Starting Nmap scan for {target_ip} (all ports)...") # Added (all ports)
     
     # --- CRUCIAL ADDITION: Ensure the output directory exists ---
     output_directory = os.path.dirname(output_file)
     if output_directory and not os.path.exists(output_directory):
         try:
-            os.makedirs(output_directory, exist_ok=True) # exist_ok=True prevents error if it already exists
+            os.makedirs(output_directory)
             print(f"[{os.path.basename(__file__)}] Created output directory: {output_directory}")
         except OSError as e:
-            print(f"[{os.path.basename(__file__)}] Error creating directory {output_directory}: {e}", file=sys.stderr)
-            return False # Indicate failure if directory cannot be created
-    # -----------------------------------------------------------
+            print(f"[{os.path.basename(__file__)}] Error creating directory {output_directory}: {e}")
+            return False
 
-    # Split the initial Nmap args string into a list, filtering out any empty strings
-    args_list = [arg for arg in INITIAL_NMAP_ARGS.split(' ') if arg]
-
-    # Construct the final Nmap command list
-    nmap_command = ["nmap"] # Nmap is expected to be in PATH, otherwise specify full path (e.g., "/usr/bin/nmap")
-    nmap_command.extend(args_list) # Add all the flags from the user's string
-    
-    # Add the XML output flag and file (Nmap expects filename directly after -oX)
-    nmap_command.append("-oX")
-    nmap_command.append(output_file)
-    
-    # Add the target IP (always the last argument for Nmap)
-    nmap_command.append(target_ip)
-    
-    print(f"[{os.path.basename(__file__)}] Executing Nmap command: {' '.join(nmap_command)}")
-    print(f"[{os.path.basename(__file__)}] Expected output file path: {output_file}")
+    nmap_command = f"nmap {INITIAL_NMAP_ARGS} -oX {output_file} {target_ip}"
+    print(f"[{os.path.basename(__file__)}] Executing Nmap command: {nmap_command}") # DEBUG
 
     try:
-        process = subprocess.run(
-            nmap_command,
-            capture_output=True,
-            text=True,
-            check=False # Do not raise an exception for non-zero exit codes, we handle them
+        # Use subprocess.run for better control and error handling
+        result = subprocess.run(
+            nmap_command.split(), # Split the command string into a list
+            capture_output=True,  # Capture stdout and stderr
+            text=True,            # Decode stdout/stderr as text
+            check=False           # Do not raise an exception for non-zero exit codes
         )
-        
-        print(f"[{os.path.basename(__file__)}] Nmap stdout:\n{process.stdout}")
-        if process.stderr:
-            print(f"[{os.path.basename(__file__)}] Nmap stderr:\n{process.stderr}")
 
-        if process.returncode != 0:
-            print(f"[{os.path.basename(__file__)}] Nmap command exited with code {process.returncode}. This might indicate an issue, but the XML file might still be partially created.")
-            
-        # Give a small moment for file system to catch up
-        time.sleep(0.5) 
+        # Print Nmap's stdout and stderr for debugging
+        if result.stdout:
+            print(f"[{os.path.basename(__file__)}] Nmap stdout:\n{result.stdout}")
+        if result.stderr:
+            print(f"[{os.path.basename(__file__)}] Nmap stderr:\n{result.stderr}")
 
+        if result.returncode != 0 and not os.path.exists(output_file):
+            print(f"[{os.path.basename(__file__)}] Nmap command failed with exit code {result.returncode}.")
+            # If Nmap exits with an error and no output file is created, it's a failure
+            return False
+
+        # Check if the output file was actually created and is not empty
         if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
             print(f"[{os.path.basename(__file__)}] Nmap scan completed. Output saved to {output_file}")
             try:
@@ -101,6 +89,8 @@ if __name__ == "__main__":
         sys.exit(1)
 
     # The hardcoded path for output within SUBSCAN.py
-    # If main.py calls this, ensure main.py passes "/output/scanout.xml"
+    # If main.py calls this, ensure main.py passes "output/scanout.xml"
     if not run_nmap_scan(target_ip, "output/scanout.xml"):
+        print(f"[{os.path.basename(__file__)}] Initial Nmap scan failed. Exiting.")
         sys.exit(1)
+    print(f"[{os.path.basename(__file__)}] Initial Nmap scan completed successfully for {target_ip}.")

@@ -23,53 +23,66 @@ type DNSXResult struct {
 }
 
 func extractSubdomains(inputFile string) ([]string, error) {
-	var subs []string
 	file, err := os.Open(inputFile)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
 
+	unique := make(map[string]bool)
+	var subs []string
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		var result SubfinderResult
-		err := json.Unmarshal([]byte(scanner.Text()), &result)
-		if err == nil {
-			subs = append(subs, result.Host)
+		if err := json.Unmarshal([]byte(scanner.Text()), &result); err == nil {
+			if !unique[result.Host] {
+				subs = append(subs, result.Host)
+				unique[result.Host] = true
+			}
 		}
 	}
 	return subs, scanner.Err()
 }
 
-func runDNSX(subs []string, outputFile string) error {
+func runDNSX(subs []string, outputFile string, verbose bool) error {
 	tmpInput := "temp_input.txt"
-	f, _ := os.Create(tmpInput)
+	f, err := os.Create(tmpInput)
+	if err != nil {
+		return err
+	}
 	for _, sub := range subs {
-		f.WriteString(sub + "\n")
+		fmt.Fprintln(f, sub)
 	}
 	f.Close()
+	defer os.Remove(tmpInput)
 
-	cmd := exec.Command("dnsx", "-silent", "-json", "-l", tmpInput, "-o", outputFile)
-	err := cmd.Run()
-	os.Remove(tmpInput)
-	return err
+	args := []string{"-silent", "-json", "-l", tmpInput, "-o", outputFile}
+	cmd := exec.Command("dnsx", args...)
+	if verbose {
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+	}
+	return cmd.Run()
 }
 
 func parseDNSXResults(outputFile string) ([]DNSXResult, error) {
-	var results []DNSXResult
 	file, err := os.Open(outputFile)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
 
+	unique := make(map[string]DNSXResult)
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		var r DNSXResult
-		err := json.Unmarshal([]byte(scanner.Text()), &r)
-		if err == nil {
-			results = append(results, r)
+		if err := json.Unmarshal([]byte(scanner.Text()), &r); err == nil {
+			unique[r.Host] = r
 		}
+	}
+	var results []DNSXResult
+	for _, r := range unique {
+		results = append(results, r)
 	}
 	return results, scanner.Err()
 }
@@ -86,24 +99,36 @@ func writeValidatedResults(results []DNSXResult, outputFile string) error {
 	return encoder.Encode(results)
 }
 
-// --------------- CLI ---------------
+// --------------- CLI Commands ---------------
 
 var rootCmd = &cobra.Command{
 	Use:   "recon",
-	Short: "Recon tool using subfinder + dnsx",
+	Short: "Subdomain recon tool using Subfinder + DNSX",
 }
 
 var scanCmd = &cobra.Command{
 	Use:   "scan",
-	Short: "Run subdomain scan using subfinder and dnsx",
+	Short: "Run subdomain enumeration and validation",
 	Run: func(cmd *cobra.Command, args []string) {
 		if domain == "" {
 			color.Red("[-] Please provide a domain using --domain")
 			os.Exit(1)
 		}
 
+		_ = os.Remove(rawFile)
+		_ = os.Remove(outputFile)
+		os.MkdirAll("output", 0755)
+
 		color.Cyan("[*] Running Subfinder...")
-		exec.Command("subfinder", "-d", domain, "-silent", "-oJ", "-o", rawFile).Run()
+		subfinderCmd := exec.Command("subfinder", "-d", domain, "-silent", "-oJ", "-o", rawFile)
+		subfinderCmd.Stderr = os.Stderr
+		if verbose {
+			subfinderCmd.Stdout = os.Stdout
+		}
+		if err := subfinderCmd.Run(); err != nil {
+			color.Red("[-] Subfinder failed: %v", err)
+			os.Exit(1)
+		}
 
 		color.Yellow("[*] Extracting subdomains...")
 		subs, err := extractSubdomains(rawFile)
@@ -112,29 +137,50 @@ var scanCmd = &cobra.Command{
 			os.Exit(1)
 		}
 
-		color.Cyan("[*] Running DNSX validation...")
-		runDNSX(subs, outputFile)
+		color.Cyan("[*] Running DNSX...")
+		if err := runDNSX(subs, outputFile, verbose); err != nil {
+			color.Red("[-] DNSX failed: %v", err)
+			os.Exit(1)
+		}
 
-		results, _ := parseDNSXResults(outputFile)
-		writeValidatedResults(results, outputFile)
+		results, err := parseDNSXResults(outputFile)
+		if err != nil {
+			color.Red("[-] Failed to parse DNSX output: %v", err)
+			os.Exit(1)
+		}
 
-		color.Green("\n[+] Live Hosts:")
+		var filtered []DNSXResult
 		for _, r := range results {
-			if len(r.A) > 0 {
-				color.Green("%s → %s", r.Host, strings.Join(r.A, ", "))
-			} else if r.CNAME != "" {
-				color.Magenta("%s → CNAME: %s", r.Host, r.CNAME)
+			if strings.HasSuffix(r.Host, domain) {
+				filtered = append(filtered, r)
 			}
 		}
 
-		color.Green("\n[✔] Output saved to %s", outputFile)
+		if err := writeValidatedResults(filtered, outputFile); err != nil {
+			color.Red("[-] Failed to write validated results: %v", err)
+			os.Exit(1)
+		}
+
+		if jsonOutput {
+			data, _ := json.MarshalIndent(filtered, "", "  ")
+			fmt.Println(string(data))
+		} else {
+			color.Green("\n[+] Live Hosts:")
+			for _, r := range filtered {
+				if len(r.A) > 0 {
+					color.Green("%s → %s", r.Host, strings.Join(r.A, ", "))
+				} else if r.CNAME != "" {
+					color.Magenta("%s → CNAME: %s", r.Host, r.CNAME)
+				}
+			}
+			color.Green("\n[✔] Output saved to %s", outputFile)
+		}
 	},
 }
 
-
 var validateCmd = &cobra.Command{
 	Use:   "validate",
-	Short: "Validate subdomains from a file using dnsx",
+	Short: "Validate subdomains from a file using DNSX",
 	Run: func(cmd *cobra.Command, args []string) {
 		if inputFile == "" || domain == "" {
 			color.Red("[-] Please provide both --file and --domain")
@@ -148,38 +194,57 @@ var validateCmd = &cobra.Command{
 			os.Exit(1)
 		}
 
-		runDNSX(subs, outputFile)
-		results, _ := parseDNSXResults(outputFile)
-		writeValidatedResults(results, outputFile)
+		if err := runDNSX(subs, outputFile, verbose); err != nil {
+			color.Red("[-] DNSX failed: %v", err)
+			os.Exit(1)
+		}
 
-		color.Green("\n[✔] Validated results written to %s", outputFile)
+		results, err := parseDNSXResults(outputFile)
+		if err != nil {
+			color.Red("[-] Failed to parse DNSX output: %v", err)
+			os.Exit(1)
+		}
+
+		if err := writeValidatedResults(results, outputFile); err != nil {
+			color.Red("[-] Failed to write output: %v", err)
+			os.Exit(1)
+		}
+
+		if jsonOutput {
+			data, _ := json.MarshalIndent(results, "", "  ")
+			fmt.Println(string(data))
+		} else {
+			color.Green("\n[✔] Validated results written to %s", outputFile)
+		}
 	},
 }
 
-
-// Shared flags
-var domain string
-var rawFile string
-var outputFile string
-var inputFile string
+// Flags
+var (
+	domain, rawFile, outputFile, inputFile string
+	jsonOutput, verbose                    bool
+)
 
 func init() {
-	// scan
+	// Scan flags
 	scanCmd.Flags().StringVar(&domain, "domain", "", "Target domain (required)")
-	scanCmd.Flags().StringVar(&rawFile, "raw", "output/raw.json", "Raw output file")
-	scanCmd.Flags().StringVar(&outputFile, "output", "output/validated.json", "Validated output file")
+	scanCmd.Flags().StringVar(&rawFile, "raw", "/home/arunexploit/Penturion/output/raw.json", "Raw subfinder output file")
+	scanCmd.Flags().StringVar(&outputFile, "output", "/home/arunexploit/Penturion/output/validated.json", "Validated DNSX output")
+	scanCmd.Flags().BoolVar(&jsonOutput, "json", false, "Print output as JSON")
+	scanCmd.Flags().BoolVar(&verbose, "verbose", false, "Enable verbose command output")
 
-	// validate
-	validateCmd.Flags().StringVar(&inputFile, "file", "", "Input subdomain file")
-	validateCmd.Flags().StringVar(&domain, "domain", "", "Target domain")
-	validateCmd.Flags().StringVar(&outputFile, "output", "output/validated.json", "Output file")
+	// Validate flags
+	validateCmd.Flags().StringVar(&inputFile, "file", "", "Input file (from subfinder or user)")
+	validateCmd.Flags().StringVar(&domain, "domain", "", "Target domain for filtering")
+	validateCmd.Flags().StringVar(&outputFile, "output", "/home/arunexploit/Penturion/output/validated.json", "Output file")
+	validateCmd.Flags().BoolVar(&jsonOutput, "json", false, "Print output as JSON")
+	validateCmd.Flags().BoolVar(&verbose, "verbose", false, "Enable verbose command output")
 
 	rootCmd.AddCommand(scanCmd)
 	rootCmd.AddCommand(validateCmd)
 }
 
 func main() {
-	os.MkdirAll("output", 0755)
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Println("Error:", err)
 		os.Exit(1)
