@@ -1,59 +1,92 @@
 import argparse
 import os
 import subprocess
+import sys
+import logging
+from datetime import datetime
 
-def run_feroxbuster(target, wordlist, output_file, threads=20, extensions=None, depth=None):
+def setup_logging():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        handlers=[
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+
+def validate_inputs(target, wordlist):
     if not os.path.exists(wordlist):
-        raise FileNotFoundError(f"[!] Wordlist not found: {wordlist}")
-    
-    if not target.startswith("http://") and not target.startswith("https://"):
-        print("[!] Target must start with http:// or https://")
-        return
+        raise FileNotFoundError(f"Wordlist not found: {wordlist}")
 
-    # Remove old output file if exists
+    if not (target.startswith("http://") or target.startswith("https://")):
+        raise ValueError("Target URL must start with http:// or https://")
+
+def prepare_output_file(output_file):
+    output_dir = os.path.dirname(output_file)
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+        logging.info(f"Created output directory: {output_dir}")
+
     if os.path.exists(output_file):
         try:
             os.remove(output_file)
-            print(f"[+] Removed old output file: {output_file}")
+            logging.info(f"Removed old output file: {output_file}")
         except Exception as e:
-            print(f"[!] Failed to remove existing output file: {e}")
-            return
+            logging.error(f"Failed to remove existing output file: {e}")
+            raise
 
+def build_feroxbuster_command(target, wordlist, output_file, threads, extensions, depth):
     command = [
         "feroxbuster",
         "-u", target,
         "-w", wordlist,
         "-t", str(threads),
         "-o", output_file,
+        "--json",
         "--silent",
-        "--insecure",  # helps avoid SSL issues
+        "--insecure",
         "-H", "User-Agent: Mozilla/5.0"
     ]
 
     if extensions:
         command += ["-x", ",".join(extensions)]
 
-    if depth:
+    if depth is not None:
         command += ["--depth", str(depth)]
 
-    print(f"[+] Running Feroxbuster on: {target}")
+    return command
 
+def run_feroxbuster(target, wordlist, output_file, threads=20, extensions=None, depth=None):
     try:
-        subprocess.run(command, check=True)
-        print(f"[✔] Feroxbuster completed. Output saved to {output_file}")
-    except subprocess.CalledProcessError as e:
-        print(f"[!] Feroxbuster failed: {e}")
+        validate_inputs(target, wordlist)
+        prepare_output_file(output_file)
+
+        command = build_feroxbuster_command(target, wordlist, output_file, threads, extensions, depth)
+        logging.info(f"Running Feroxbuster on: {target}")
+
+        result = subprocess.run(command, capture_output=True, text=True, timeout=600)
+
+        if result.returncode == 0:
+            logging.info(f"Feroxbuster completed successfully. Output saved to: {output_file}")
+        else:
+            logging.error(f"Feroxbuster failed with return code {result.returncode}")
+            logging.error(f"stderr: {result.stderr}")
+
     except FileNotFoundError:
-        print("[!] Feroxbuster not found. Is it installed and in PATH?")
+        logging.error("Feroxbuster not found. Is it installed and in your PATH?")
+    except subprocess.TimeoutExpired:
+        logging.error("Feroxbuster execution timed out.")
     except Exception as e:
-        print(f"[!] Unexpected error: {e}")
+        logging.exception(f"Unexpected error occurred: {e}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Python wrapper for Feroxbuster")
+    setup_logging()
+
+    parser = argparse.ArgumentParser(description="Advanced Python wrapper for Feroxbuster")
     parser.add_argument("--target", required=True, help="Target URL (e.g., https://example.com)")
     parser.add_argument("--wordlist", default="/usr/share/seclists/Discovery/Web-Content/common.txt",
                         help="Path to wordlist")
-    parser.add_argument("--output", default="/home/arunexploit/Penturion/output/ferox_output.txt",
+    parser.add_argument("--output", default=f"./output/ferox_output_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
                         help="Output file path")
     parser.add_argument("--threads", type=int, default=20, help="Number of threads")
     parser.add_argument("--extensions", default="php,html,js,txt,json,xml,asp,aspx,jsp",

@@ -47,16 +47,25 @@ def get_domain_for_ip(ip, json_file_path):
         with open(json_file_path, 'r') as f:
             data = json.load(f)
             hosts = data.get("nmaprun", {}).get("host", [])
+
+            # Normalize single host dict
             if isinstance(hosts, dict):
-                hosts = [hosts]  # Normalize if it's a single host as dict
+                hosts = [hosts]
 
             for host in hosts:
                 addresses = host.get("addresses", {})
                 if addresses.get("addr") == ip:
-                    hostnames = host.get("hostnames", {}).get("hostname", [])
+                    hostnames = host.get("hostnames", {})
+
+                    # In some cases, 'hostnames' is an empty list or dict
                     if isinstance(hostnames, dict):
-                        hostnames = [hostnames]
-                    for hn in hostnames:
+                        hostnames_list = hostnames.get("hostname", [])
+                        if isinstance(hostnames_list, dict):
+                            hostnames_list = [hostnames_list]
+                    else:
+                        hostnames_list = []
+
+                    for hn in hostnames_list:
                         name = hn.get("name")
                         if name:
                             return name
@@ -66,7 +75,7 @@ def get_domain_for_ip(ip, json_file_path):
 
 if __name__ == "__main__":
     print_banner()
-    DEBUG_MODE = True
+    DEBUG_MODE = False
 
     if not DEBUG_MODE:
         try:
@@ -98,10 +107,9 @@ if __name__ == "__main__":
         if not target_ip:
             print(Fore.RED + Style.BRIGHT + f"[!] Could not resolve IP for domain '{target_domain}'.")
         elif not target_domain:
-            print(Fore.YELLOW + Style.BRIGHT + f"[!] No domain name found for IP {target_ip} in result.json. Skipping subdomain scan.")
+            print(Fore.YELLOW + Style.BRIGHT + f"[!] No domain name found for IP {target_ip} in result.json.")
         else:
-            print(Fore.CYAN + Style.BRIGHT + f"[*] Found domain '{target_domain}' for IP {target_ip}. Running subdomain scan...")
-
+            print(Fore.CYAN + Style.BRIGHT + f"[*] Found domain '{target_domain}' for IP {target_ip}. Running subdomain scan...\n")
             try:
                 command = ["/home/arunexploit/Penturion/inbuilt_Tool/recon/recon", "scan", "--domain", target_domain]
                 result = subprocess.run(command, capture_output=True, text=True, check=True)
@@ -109,9 +117,6 @@ if __name__ == "__main__":
                 print(result.stdout)
             except subprocess.CalledProcessError as e:
                 print(Fore.RED + f"[!] Error during subdomain scan:\n{e.stderr}")
-    
-
-
     except FileNotFoundError:
         print(Fore.RED + Style.BRIGHT + "[!] penturion_target.txt not found. Please provide a valid target.")
     except json.JSONDecodeError:
@@ -119,33 +124,84 @@ if __name__ == "__main__":
     except Exception as e:
         print(Fore.RED + Style.BRIGHT + f"[!] Unexpected error: {e}")
 
+    # -------------------------
+    # Feroxbuster Scan
+    # -------------------------
+    json_output = f"/home/arunexploit/Penturion/output/ferox_output_{target_domain}.json"
+
     try:
+        print(Fore.CYAN + Style.BRIGHT + "\n[*] Starting Feroxbuster scan...\n")
         result = subprocess.run([
             "python3",
             "/home/arunexploit/Penturion/inbuilt_Tool/recon/feroxbuster.py",
             "--target", f"https://{target_domain}",
             "--wordlist", "/usr/share/seclists/Discovery/Web-Content/common.txt",
-            "--output", "/home/arunexploit/Penturion/output/ferox_output.txt",
+            "--output", json_output,
             "--threads", "30",
             "--extensions", "php,html,js,txt,json,xml,asp,aspx,jsp",
             "--depth", "2"
-        ], capture_output=True, text=True, check=True)
+        ], capture_output=True, text=True, timeout=600, check=True)
 
-        # Check for errors in output
         if "Could not connect" in result.stdout or "ERROR" in result.stdout:
-            print(Fore.RED + Style.BRIGHT + "[!] Feroxbuster ran but failed to connect to the target.")
+            print(Fore.RED + Style.BRIGHT + "[!] Feroxbuster ran but failed to connect.")
             print(Fore.YELLOW + result.stdout)
         else:
-            print(Fore.GREEN + Style.BRIGHT + "\n[*] Feroxbuster scan completed successfully!\n")
+            print(Fore.GREEN + Style.BRIGHT + "\n[✔] Feroxbuster scan completed successfully!\n")
             print(result.stdout)
 
     except subprocess.CalledProcessError as e:
         print(Fore.RED + Style.BRIGHT + f"[!] Feroxbuster scan failed:\n{e.stderr}")
     except FileNotFoundError:
-        print(Fore.RED + Style.BRIGHT + "[!] Python script not found. Check the path to feroxbuster.py.")
+        print(Fore.RED + Style.BRIGHT + "[!] feroxbuster.py not found.")
     except Exception as e:
-        print(Fore.RED + Style.BRIGHT + f"[!] Unexpected error: {e}")
+        print(Fore.RED + Style.BRIGHT + f"[!] Unexpected error during Feroxbuster scan: {e}")
 
-    print(Fore.MAGENTA + Style.BRIGHT + "\n[*] Pentesting automation completed. Check the output directory for results.\n")
-    print(Fore.MAGENTA + Style.BRIGHT + "-" * 65 + Style.RESET_ALL)
-    print(Fore.YELLOW + Style.BRIGHT + "[*] Thank you for using the Automated Web Pentesting Framework!\n")
+    # -------------------------
+    # Nmap XML Report to Text
+    # -------------------------
+    try:
+        print(Fore.GREEN + Style.BRIGHT + "\n[*] Running Nmap XML to Text conversion...\n")
+        subprocess.run(["python3", "/home/arunexploit/Penturion/AImodel/reportgen.py"], check=True)
+        print(Fore.GREEN + Style.BRIGHT + "[✔] Nmap XML to Text conversion completed!\n")
+    except subprocess.CalledProcessError as e:
+        print(Fore.RED + Style.BRIGHT + f"[!] Error during Nmap XML to Text conversion:\n{e.stderr}")
+    except FileNotFoundError:
+        print(Fore.RED + Style.BRIGHT + "[!] reportgen.py not found.")
+    except Exception as e:
+        print(Fore.RED + Style.BRIGHT + f"[!] Unexpected error during report generation: {e}")
+
+    # -------------------------
+    # Ferox JSON → CSV
+    # -------------------------
+    csv_output = f"/home/arunexploit/Penturion/output/ferox_output_{target_domain}.csv"
+
+    try:
+        print(Fore.CYAN + Style.BRIGHT + "\n[*] Converting Ferox JSON to CSV...\n")
+        result = subprocess.run([
+            "python3",
+            "/home/arunexploit/Penturion/inbuilt_Tool/recon/feroreportjson.py",
+            "--input", json_output,
+            "--output", csv_output
+        ], capture_output=True, text=True, check=True)
+
+        print(Fore.GREEN + Style.BRIGHT + "[✔] JSON to CSV conversion completed.")
+        if result.stdout:
+            print(Fore.YELLOW + "[STDOUT]\n" + result.stdout)
+        if result.stderr:
+            print(Fore.RED + "[STDERR]\n" + result.stderr)
+
+    except subprocess.CalledProcessError as e:
+        print(Fore.RED + f"[!] CSV script failed with code {e.returncode}")
+        print("[STDOUT]\n", e.stdout)
+        print("[STDERR]\n", e.stderr)
+    except FileNotFoundError:
+        print(Fore.RED + "[!] ferox_json_to_csv.py not found.")
+    except Exception as ex:
+        print(Fore.RED + f"[!] Unexpected error during CSV conversion: {ex}")
+
+    # -------------------------
+    # Final Message
+    # -------------------------
+    print(Fore.MAGENTA + Style.BRIGHT + "\n[*] Pentesting automation completed. Check the output directory for results.")
+    print("-" * 65 + Style.RESET_ALL)
+    print(Fore.YELLOW + Style.BRIGHT + "[*] Thank you for using the Automated Web Pentesting Framework!\n" + Style.RESET_ALL)
