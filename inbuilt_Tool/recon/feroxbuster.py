@@ -36,25 +36,25 @@ def prepare_output_file(output_file):
             raise
 
 def build_feroxbuster_command(target, wordlist, output_file, threads, extensions, depth):
-    command = [
-        "feroxbuster",
-        "-u", target,
-        "-w", wordlist,
-        "-t", str(threads),
-        "-o", output_file,
-        "--json",
+    base_cmd = [
+        "/home/arunexploit/.cargo/bin/feroxbuster",
+        f"-u {target}",
+        f"-w {wordlist}",
+        f"-t {threads}",
         "--silent",
         "--insecure",
-        "-H", "User-Agent: Mozilla/5.0"
+        '-H "User-Agent: Mozilla/5.0"'
     ]
 
     if extensions:
-        command += ["-x", ",".join(extensions)]
+        base_cmd.append(f"-x {','.join(extensions)}")
 
     if depth is not None:
-        command += ["--depth", str(depth)]
+        base_cmd.append(f"--depth {depth}")
 
-    return command
+    # Join the command into a single shell string and append redirection
+    full_cmd = " ".join(base_cmd) + f" > {output_file}"
+    return full_cmd
 
 def run_feroxbuster(target, wordlist, output_file, threads=20, extensions=None, depth=None):
     try:
@@ -63,8 +63,9 @@ def run_feroxbuster(target, wordlist, output_file, threads=20, extensions=None, 
 
         command = build_feroxbuster_command(target, wordlist, output_file, threads, extensions, depth)
         logging.info(f"Running Feroxbuster on: {target}")
+        logging.debug(f"Command: {command}")  # Optional debug line
 
-        result = subprocess.run(command, capture_output=True, text=True, timeout=600)
+        result = subprocess.run(command, shell=True, text=True, timeout=600)
 
         if result.returncode == 0:
             logging.info(f"Feroxbuster completed successfully. Output saved to: {output_file}")
@@ -78,6 +79,7 @@ def run_feroxbuster(target, wordlist, output_file, threads=20, extensions=None, 
         logging.error("Feroxbuster execution timed out.")
     except Exception as e:
         logging.exception(f"Unexpected error occurred: {e}")
+
 
 if __name__ == "__main__":
     setup_logging()

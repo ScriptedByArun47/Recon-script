@@ -124,9 +124,9 @@ if __name__ == "__main__":
     except Exception as e:
         print(Fore.RED + Style.BRIGHT + f"[!] Unexpected error: {e}")
 
-    # -------------------------
+ 
     # Feroxbuster Scan
-    # -------------------------
+   
     json_output = f"/home/arunexploit/Penturion/output/ferox_output_{target_domain}.json"
 
     try:
@@ -136,7 +136,6 @@ if __name__ == "__main__":
             "/home/arunexploit/Penturion/inbuilt_Tool/recon/feroxbuster.py",
             "--target", f"https://{target_domain}",
             "--wordlist", "/usr/share/seclists/Discovery/Web-Content/common.txt",
-            "--output", json_output,
             "--threads", "30",
             "--extensions", "php,html,js,txt,json,xml,asp,aspx,jsp",
             "--depth", "2"
@@ -156,9 +155,9 @@ if __name__ == "__main__":
     except Exception as e:
         print(Fore.RED + Style.BRIGHT + f"[!] Unexpected error during Feroxbuster scan: {e}")
 
-    # -------------------------
+    
     # Nmap XML Report to Text
-    # -------------------------
+   
     try:
         print(Fore.GREEN + Style.BRIGHT + "\n[*] Running Nmap XML to Text conversion...\n")
         subprocess.run(["python3", "/home/arunexploit/Penturion/AImodel/reportgen.py"], check=True)
@@ -170,38 +169,13 @@ if __name__ == "__main__":
     except Exception as e:
         print(Fore.RED + Style.BRIGHT + f"[!] Unexpected error during report generation: {e}")
 
-    # -------------------------
-    # Ferox JSON → CSV
-    # -------------------------
-    csv_output = f"/home/arunexploit/Penturion/output/ferox_output_{target_domain}.csv"
+    
+    
+    
 
-    try:
-        print(Fore.CYAN + Style.BRIGHT + "\n[*] Converting Ferox JSON to CSV...\n")
-        result = subprocess.run([
-            "python3",
-            "/home/arunexploit/Penturion/inbuilt_Tool/recon/feroreportjson.py",
-            "--input", json_output,
-            "--output", csv_output
-        ], capture_output=True, text=True, check=True)
-
-        print(Fore.GREEN + Style.BRIGHT + "[✔] JSON to CSV conversion completed.")
-        if result.stdout:
-            print(Fore.YELLOW + "[STDOUT]\n" + result.stdout)
-        if result.stderr:
-            print(Fore.RED + "[STDERR]\n" + result.stderr)
-
-    except subprocess.CalledProcessError as e:
-        print(Fore.RED + f"[!] CSV script failed with code {e.returncode}")
-        print("[STDOUT]\n", e.stdout)
-        print("[STDERR]\n", e.stderr)
-    except FileNotFoundError:
-        print(Fore.RED + "[!] ferox_json_to_csv.py not found.")
-    except Exception as ex:
-        print(Fore.RED + f"[!] Unexpected error during CSV conversion: {ex}")
-
-    # -------------------------
     # Final Message
-    # -------------------------
+
+    
     print(Fore.MAGENTA + Style.BRIGHT + "\n[*] Pentesting automation completed. Check the output directory for results.")
     print("-" * 65 + Style.RESET_ALL)
     print(Fore.YELLOW + Style.BRIGHT + "[*] Thank you for using the Automated Web Pentesting Framework!\n" + Style.RESET_ALL)
