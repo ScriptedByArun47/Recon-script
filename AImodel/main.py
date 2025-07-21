@@ -1040,7 +1040,7 @@ if __name__ == "__main__":
             sys.exit(1)
         with open("output/penturion_target.txt", "w") as f:
              f.write(initial_target_ip)
-             print(f"[main.py] Target IP written to /tmp/penturion_target.txt: {initial_target_ip}")
+             print(f"[main.py] Target IP written to /output/penturion_target.txt: {initial_target_ip}")
         initial_facts.add_fact('target_ip', initial_target_ip)
         initial_facts.add_fact('scan_stage', 'initial_scan_pending')
 

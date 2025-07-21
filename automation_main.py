@@ -75,7 +75,7 @@ def get_domain_for_ip(ip, json_file_path):
 
 if __name__ == "__main__":
     print_banner()
-    DEBUG_MODE = False
+    DEBUG_MODE = True
 
     if not DEBUG_MODE:
         try:
@@ -154,8 +154,15 @@ if __name__ == "__main__":
         print(Fore.RED + Style.BRIGHT + "[!] feroxbuster.py not found.")
     except Exception as e:
         print(Fore.RED + Style.BRIGHT + f"[!] Unexpected error during Feroxbuster scan: {e}")
-
     
+    domain=f"https://{target_domain}"
+    # Gobuster Scan
+    script_path = "/home/arunexploit/Penturion/inbuilt_Tool/recon/gobust.sh" 
+    try:
+        subprocess.run(["bash", script_path, domain], check=True)
+
+    except subprocess.CalledProcessError as e:
+        print(f"[!] Script failed: {e}")
     # Nmap XML Report to Text
    
     try:
