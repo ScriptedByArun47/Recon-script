@@ -326,19 +326,81 @@ if ! [[ "$RATE_LIMIT" =~ ^[0-9]+$ ]]; then
 fi
 
 # ─────────────────────────────────────────
-# SCOPE FILTER
+# SCOPE FILTER — Burp Suite JSON support
+# Detects scope file type automatically:
+#   .json → parsed as Burp Suite scope.json
+#   .txt  → plain grep pattern file (legacy)
+#   none  → no filtering (pass-through)
 # ─────────────────────────────────────────
+
+# Source the Burp scope parser from same directory as this script
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCOPE_PARSER="${SCRIPT_DIR}/scope_parser.sh"
+
+_scope_init_done=false
+
+_init_scope() {
+  [ "$_scope_init_done" = true ] && return
+  _scope_init_done=true
+
+  if [ -z "$SCOPE_FILE" ] || [ ! -f "$SCOPE_FILE" ]; then
+    info "No scope file — all targets in scope"
+    return
+  fi
+
+  # Detect JSON vs plain text
+  if echo "$SCOPE_FILE" | grep -qi "\.json$" || \
+     head -1 "$SCOPE_FILE" 2>/dev/null | grep -q '^\s*{'; then
+    # Burp Suite JSON scope
+    if [ ! -f "$SCOPE_PARSER" ]; then
+      error "scope_parser.sh not found at $SCOPE_PARSER"
+      error "Place scope_parser.sh next to penturion.sh and retry"
+      exit 1
+    fi
+    # shellcheck source=scope_parser.sh
+    source "$SCOPE_PARSER"
+    parse_burp_scope "$SCOPE_FILE"
+    scope_summary
+  else
+    # Legacy plain-text pattern file — set SCOPE_LOADED=false so
+    # apply_scope falls back to grep-based filtering
+    SCOPE_LOADED=false
+    info "Scope file (plain text patterns): $SCOPE_FILE"
+  fi
+}
+
+# apply_scope <input_file> <output_file>
+# Wraps both subdomain and URL filtering in one call.
+# Automatically picks the right method based on file content.
 apply_scope() {
   local infile="$1" outfile="$2"
+
+  # Pass-through if no scope file
   if [ -z "$SCOPE_FILE" ] || [ ! -f "$SCOPE_FILE" ]; then
     cp "$infile" "$outfile" 2>/dev/null || touch "$outfile"
     return
   fi
-  grep -f "$SCOPE_FILE" "$infile" 2>/dev/null | sort -u > "$outfile" || touch "$outfile"
-  local before after
+
+  # Lazy-init scope on first call
+  _init_scope
+
+  local before
   before=$(wc -l < "$infile" 2>/dev/null || echo 0)
-  after=$(wc -l < "$outfile" 2>/dev/null || echo 0)
-  info "Scope filter: $before → $after subdomains kept"
+
+  if [ "${SCOPE_LOADED:-false}" = true ]; then
+    # Burp JSON — detect if input looks like URLs or hostnames
+    if head -5 "$infile" 2>/dev/null | grep -qE "^https?://"; then
+      apply_scope_urls "$infile" "$outfile"
+    else
+      apply_scope_subdomains "$infile" "$outfile"
+    fi
+  else
+    # Plain text pattern file — legacy grep mode
+    grep -f "$SCOPE_FILE" "$infile" 2>/dev/null | sort -u > "$outfile" || touch "$outfile"
+    local after
+    after=$(wc -l < "$outfile" 2>/dev/null || echo 0)
+    info "Scope filter (grep): $before → $after kept"
+  fi
 }
 
 # ─────────────────────────────────────────
@@ -429,9 +491,34 @@ START_TIME=$(date +%s)
 if [ "$RESUME_MODE" = true ] && [ -f .start_time_epoch ]; then
   START_TIME=$(cat .start_time_epoch)
   banner "PENTURION v7 — RESUME → $domain"
+
+  # ── Auto-restore scope + rate-limit from saved session config ──
+  if [ -f .session_config ]; then
+    SAVED_SCOPE=$(jq -r '.scope_file // empty' .session_config 2>/dev/null || true)
+    SAVED_RATE=$(jq -r '.rate_limit // empty'  .session_config 2>/dev/null || true)
+
+    if [ -z "$SCOPE_FILE" ] && [ -n "$SAVED_SCOPE" ] && [ -f "$SAVED_SCOPE" ]; then
+      SCOPE_FILE="$SAVED_SCOPE"
+      warn "Scope auto-restored: $SCOPE_FILE"
+    elif [ -z "$SCOPE_FILE" ] && [ -n "$SAVED_SCOPE" ]; then
+      warn "Saved scope not found at: $SAVED_SCOPE — resuming without scope filter"
+    fi
+
+    if [ "$RATE_LIMIT" = "50" ] && [ -n "$SAVED_RATE" ]; then
+      RATE_LIMIT="$SAVED_RATE"
+      info "Rate limit restored: ${RATE_LIMIT} req/s"
+    fi
+  else
+    warn "No session config found — pass --scope=scope.json manually if needed"
+  fi
+
 else
   banner "PENTURION v7 → $domain"
   echo "$START_TIME" > .start_time_epoch
+
+  # ── Save session config so --resume auto-restores scope + rate ──
+  printf '{\n  "target": "%s",\n  "scope_file": "%s",\n  "rate_limit": %s,\n  "started": "%s"\n}\n' \
+    "$domain" "${SCOPE_FILE:-}" "$RATE_LIMIT" "$(date -u -Iseconds)" > .session_config
 fi
 
 echo "$domain" > .target
@@ -903,39 +990,69 @@ phase_screenshots() {
 }
 
 # ── Phase 14 — CORS & Security Header Audit ──
+# FIX: run in a subshell with set +e so curl/grep failures
+# never propagate up to trigger the EXIT trap falsely.
 phase_headers() {
-  while IFS= read -r url; do
-    [ -z "$url" ] && continue
-    echo "=== $url ===" >> headers/raw_headers.txt
-    RESP=$(curl -sk --max-time 10 -I \
-      -H "Origin: https://evil-cors-test.com" \
-      -H "Access-Control-Request-Method: GET" \
-      "$url" 2>/dev/null) || continue
-    echo "$RESP" >> headers/raw_headers.txt
+  (
+    set +e  # disable errexit inside this phase — curl/grep non-zero is expected
+    touch headers/cors_vulns.txt headers/missing_headers.txt \
+          headers/weak_csp.txt headers/cors_info.txt headers/raw_headers.txt
 
-    ACAO=$(echo "$RESP" | grep -i "access-control-allow-origin"      | tr -d '\r')
-    ACAC=$(echo "$RESP" | grep -i "access-control-allow-credentials" | tr -d '\r')
+    while IFS= read -r url; do
+      [ -z "$url" ] && continue
+      echo "=== $url ===" >> headers/raw_headers.txt
 
-    echo "$ACAO" | grep -q "evil-cors-test.com" && \
-      echo "[CORS-REFLECT] $url" >> headers/cors_vulns.txt || true
-    if echo "$ACAO" | grep -q "\*"; then
-      echo "$ACAC" | grep -qi "true" \
-        && echo "[CORS-WILDCARD+CREDS] $url" >> headers/cors_vulns.txt \
-        || echo "[CORS-WILDCARD] $url"       >> headers/cors_info.txt
-    fi
-    echo "$ACAO" | grep -q "null" && echo "[CORS-NULL] $url" >> headers/cors_vulns.txt || true
+      RESP=$(curl -sk --max-time 10 -I \
+        -H "Origin: https://evil-cors-test.com" \
+        -H "Access-Control-Request-Method: GET" \
+        "$url" 2>/dev/null)
+      # curl failed or empty response — skip this URL
+      [ -z "$RESP" ] && continue
+      echo "$RESP" >> headers/raw_headers.txt
 
-    echo "$RESP" | grep -qi "strict-transport-security"    || echo "[MISSING] HSTS: $url"                >> headers/missing_headers.txt
-    echo "$RESP" | grep -qi "x-frame-options\|frame-ancestors" || echo "[MISSING] X-Frame-Options: $url" >> headers/missing_headers.txt
-    echo "$RESP" | grep -qi "x-content-type-options"       || echo "[MISSING] X-Content-Type: $url"      >> headers/missing_headers.txt
-    echo "$RESP" | grep -qi "content-security-policy"      || echo "[MISSING] CSP: $url"                 >> headers/missing_headers.txt
+      ACAO=$(echo "$RESP" | grep -i "access-control-allow-origin"      | tr -d '\r' || true)
+      ACAC=$(echo "$RESP" | grep -i "access-control-allow-credentials" | tr -d '\r' || true)
 
-    CSP=$(echo "$RESP" | grep -i "content-security-policy" | tr -d '\r')
-    [ -n "$CSP" ] && echo "$CSP" | grep -qiE "unsafe-inline|unsafe-eval|script-src[^;]*\*" && \
-      echo "[WEAK-CSP] $url — $CSP" >> headers/weak_csp.txt || true
-  done < web/live_urls.txt
+      # CORS checks
+      if echo "$ACAO" | grep -q "evil-cors-test.com"; then
+        echo "[CORS-REFLECT] $url" >> headers/cors_vulns.txt
+      fi
+      if echo "$ACAO" | grep -q "\*"; then
+        if echo "$ACAC" | grep -qi "true"; then
+          echo "[CORS-WILDCARD+CREDS] $url" >> headers/cors_vulns.txt
+        else
+          echo "[CORS-WILDCARD] $url" >> headers/cors_info.txt
+        fi
+      fi
+      if echo "$ACAO" | grep -q "null"; then
+        echo "[CORS-NULL] $url" >> headers/cors_vulns.txt
+      fi
 
-  touch headers/cors_vulns.txt headers/missing_headers.txt headers/weak_csp.txt headers/cors_info.txt
+      # Missing header checks — each on its own line, no chaining
+      if ! echo "$RESP" | grep -qi "strict-transport-security"; then
+        echo "[MISSING] HSTS: $url" >> headers/missing_headers.txt
+      fi
+      if ! echo "$RESP" | grep -qi "x-frame-options\|frame-ancestors"; then
+        echo "[MISSING] X-Frame-Options: $url" >> headers/missing_headers.txt
+      fi
+      if ! echo "$RESP" | grep -qi "x-content-type-options"; then
+        echo "[MISSING] X-Content-Type: $url" >> headers/missing_headers.txt
+      fi
+      if ! echo "$RESP" | grep -qi "content-security-policy"; then
+        echo "[MISSING] CSP: $url" >> headers/missing_headers.txt
+      fi
+
+      # Weak CSP check
+      CSP=$(echo "$RESP" | grep -i "content-security-policy" | tr -d '\r' || true)
+      if [ -n "$CSP" ]; then
+        if echo "$CSP" | grep -qiE "unsafe-inline|unsafe-eval|script-src[^;]*\*"; then
+          echo "[WEAK-CSP] $url — $CSP" >> headers/weak_csp.txt
+        fi
+      fi
+
+    done < web/live_urls.txt
+  )  # end subshell — set -e restored automatically
+
   success "CORS: $(wc -l < headers/cors_vulns.txt) | Missing: $(wc -l < headers/missing_headers.txt) | Weak CSP: $(wc -l < headers/weak_csp.txt)"
 }
 
@@ -951,14 +1068,17 @@ phase_techfp() {
       || touch techfp/detected_versions.txt
   else
     warn "whatweb not installed — header fallback..."
-    while IFS= read -r url; do
-      [ -z "$url" ] && continue
-      RESP=$(curl -sk --max-time 10 -I "$url" 2>/dev/null)
-      for hdr in server x-powered-by x-generator; do
-        val=$(echo "$RESP" | grep -i "^${hdr}:" | tr -d '\r' | head -1)
-        [ -n "$val" ] && echo "$url | $val" >> techfp/detected_versions.txt
-      done
-    done < web/live_urls.txt
+    (
+      set +e
+      while IFS= read -r url; do
+        [ -z "$url" ] && continue
+        RESP=$(curl -sk --max-time 10 -I "$url" 2>/dev/null)
+        for hdr in server x-powered-by x-generator; do
+          val=$(echo "$RESP" | grep -i "^${hdr}:" | tr -d '\r' | head -1 || true)
+          [ -n "$val" ] && echo "$url | $val" >> techfp/detected_versions.txt
+        done
+      done < web/live_urls.txt
+    )
     sort -u techfp/detected_versions.txt -o techfp/detected_versions.txt 2>/dev/null \
       || touch techfp/detected_versions.txt
   fi
@@ -1054,63 +1174,120 @@ phase_asn() {
 # ── Phase 18 — Content Discovery (NEW) ──
 phase_dirbrute() {
   WORDLIST="${DIRBRUTE_WORDLIST:-/usr/share/seclists/Discovery/Web-Content/common.txt}"
-  # Fallback wordlists
+
+  # Fallback wordlists in order of preference
   if [ ! -f "$WORDLIST" ]; then
     for fallback in \
       "/usr/share/wordlists/dirb/common.txt" \
       "/usr/share/dirbuster/wordlists/directory-list-2.3-medium.txt" \
+      "/opt/wordlists/SecLists/Discovery/Web-Content/common.txt" \
       "$HOME/wordlists/common.txt"; do
       [ -f "$fallback" ] && WORDLIST="$fallback" && break
     done
   fi
+
   if [ ! -f "$WORDLIST" ]; then
     warn "No wordlist found. Set DIRBRUTE_WORDLIST=/path/to/wordlist.txt"; return
   fi
   info "Using wordlist: $WORDLIST"
 
   mkdir -p dirbrute
+
+  # ffuf gets its own rate (faster than global recon rate)
+  FFUF_RATE="${FFUF_RATE:-200}"
+  info "ffuf rate: ${FFUF_RATE} req/s  (override with FFUF_RATE=N)"
+
+  local total_urls current=0
+  total_urls=$(wc -l < web/live_urls.txt 2>/dev/null | tr -d ' ' || echo 0)
+
   while IFS= read -r url; do
     [ -z "$url" ] && continue
+    current=$((current + 1))
     safe=$(printf '%s' "$url" | md5sum | cut -d' ' -f1)
-    ffuf -u "${url}/FUZZ" \
-         -w "$WORDLIST" \
-         -mc 200,201,204,301,302,307,401,403,405 \
-         -t 50 \
-         -rate "$RATE_LIMIT" \
-         -o "dirbrute/${safe}.json" \
-         -of json \
-         -timeout 10 \
-         -s 2>/dev/null || true
+    outfile="dirbrute/${safe}.json"
+
+    info "[$current/$total_urls] ffuf → $url"
+
+    # Run ffuf in a subshell so set -e doesn't abort on non-zero exit
+    (
+      set +e
+      ffuf -u "${url}/FUZZ" \
+           -w "$WORDLIST" \
+           -mc 200,201,204,301,302,307,401,403,405 \
+           -fc 404 \
+           -t 50 \
+           -rate "$FFUF_RATE" \
+           -o "$outfile" \
+           -of json \
+           -timeout 10 \
+           -c \
+           -s 2>/dev/null
+      # Validate JSON — ffuf can write partial JSON on interrupt/timeout
+      if [ -f "$outfile" ]; then
+        jq empty "$outfile" 2>/dev/null || rm -f "$outfile"
+      fi
+    )
   done < web/live_urls.txt
 
-  # Merge results
-  jq -r '.results[]?.url' dirbrute/*.json 2>/dev/null \
-    | sort -u > dirbrute/all_found_paths.txt || touch dirbrute/all_found_paths.txt
+  # ── Merge: paths only ──
+  : > dirbrute/all_found_paths.txt
+  for jfile in dirbrute/*.json; do
+    [ -f "$jfile" ] || continue
+    jq -r '.results[]? | .url // empty' "$jfile" 2>/dev/null \
+      >> dirbrute/all_found_paths.txt || true
+  done
+  sort -u dirbrute/all_found_paths.txt -o dirbrute/all_found_paths.txt 2>/dev/null || true
 
-  # High value finds
-  grep -iE "(\.env|\.git|backup|config|admin|swagger|openapi|phpinfo|\.sql|\.zip|\.bak|\.tar|wp-admin|phpmyadmin|\.DS_Store|api-docs)" \
-    dirbrute/all_found_paths.txt > dirbrute/high_value.txt 2>/dev/null || touch dirbrute/high_value.txt
+  # ── Merge: paths WITH status codes + size for reporting ──
+  : > dirbrute/all_found_with_status.txt
+  for jfile in dirbrute/*.json; do
+    [ -f "$jfile" ] || continue
+    jq -r '.results[]? | "[\(.status)] \(.url) [\(.length)b]"' "$jfile" 2>/dev/null \
+      >> dirbrute/all_found_with_status.txt || true
+  done
+  sort -u dirbrute/all_found_with_status.txt -o dirbrute/all_found_with_status.txt 2>/dev/null || true
 
-  # 403 bypass candidates
-  grep -E "/.*" dirbrute/all_found_paths.txt \
-    | while IFS= read -r path; do
-      # try common 403 bypass headers
-      for header in "X-Original-URL: $path" "X-Rewrite-URL: $path" "X-Custom-IP-Authorization: 127.0.0.1"; do
-        resp=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 \
-          -H "$header" "${path%/*}/" 2>/dev/null || echo "000")
-        [ "$resp" = "200" ] && echo "[403-BYPASS] $path via $header" >> dirbrute/bypass_found.txt
-      done
-    done 2>/dev/null || touch dirbrute/bypass_found.txt
+  # ── High-value finds (expanded) ──
+  grep -iE \
+    "(\.env|\.git|\.gitignore|\.svn|\.DS_Store|backup|config|admin|swagger|openapi|phpinfo|\.sql|\.zip|\.bak|\.tar\.gz?|wp-admin|phpmyadmin|api-docs|actuator|debug|console|\.key|\.pem|\.p12|\.pfx|\.crt|\.cer)" \
+    dirbrute/all_found_paths.txt > dirbrute/high_value.txt 2>/dev/null \
+    || touch dirbrute/high_value.txt
 
-  # Feed high-value into nuclei
+  # ── 403 bypass — ONLY on actual 403 responses ──
+  (
+    set +e
+    touch dirbrute/bypass_found.txt
+    grep "^\[403\]" dirbrute/all_found_with_status.txt 2>/dev/null \
+      | grep -oP 'https?://\S+' \
+      | while IFS= read -r path; do
+          for header in \
+            "X-Original-URL: /" \
+            "X-Rewrite-URL: /" \
+            "X-Custom-IP-Authorization: 127.0.0.1" \
+            "X-Forwarded-For: 127.0.0.1" \
+            "X-Real-IP: 127.0.0.1"; do
+            resp=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 \
+              -H "$header" "$path" 2>/dev/null || echo "000")
+            if [ "$resp" = "200" ]; then
+              echo "[403-BYPASS] $path  via '$header'" >> dirbrute/bypass_found.txt
+            fi
+          done
+        done
+  )
+
+  # ── Feed high-value paths into nuclei ──
   if command -v nuclei &>/dev/null && [ -s dirbrute/high_value.txt ]; then
-    nuclei -l dirbrute/high_value.txt -s critical,high -rl "$RATE_LIMIT" \
-      -o dirbrute/nuclei_on_paths.txt 2>/dev/null || touch dirbrute/nuclei_on_paths.txt
+    info "Running nuclei on high-value paths..."
+    nuclei -l dirbrute/high_value.txt -s critical,high \
+      -rl "$RATE_LIMIT" -o dirbrute/nuclei_on_paths.txt 2>/dev/null \
+      || touch dirbrute/nuclei_on_paths.txt
+    success "Nuclei on paths: $(wc -l < dirbrute/nuclei_on_paths.txt) findings"
+  else
+    touch dirbrute/nuclei_on_paths.txt
   fi
 
-  success "Paths found: $(wc -l < dirbrute/all_found_paths.txt) | High value: $(wc -l < dirbrute/high_value.txt) | Bypass: $(wc -l < dirbrute/bypass_found.txt 2>/dev/null || echo 0)"
+  success "Paths: $(wc -l < dirbrute/all_found_paths.txt) | High value: $(wc -l < dirbrute/high_value.txt) | 403 bypass: $(wc -l < dirbrute/bypass_found.txt)"
 }
-
 # ── Phase 19 — Parameter Enumeration (NEW) ──
 phase_params() {
   mkdir -p params
