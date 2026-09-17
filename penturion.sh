@@ -239,7 +239,7 @@ RUN_RESOLVE=true; RUN_HTTPX=true;   RUN_WAF=true;        RUN_PORTS=true
 RUN_JS=true;     RUN_JSDEEP=true;   RUN_SECRETS=true;    RUN_TAKEOVER=true
 RUN_NUCLEI=true; RUN_SCREENSHOTS=true
 RUN_HEADERS=true; RUN_TECHFP=true;  RUN_FAVICON=true
-RUN_ASN=true;    RUN_DIRBRUTE=true; RUN_PARAMS=true
+RUN_ASN=true;    RUN_DIRBRUTE=true;  RUN_403BYPASS=true; RUN_PARAMS=true
 RUN_CLOUD=true;  RUN_VULNHELPER=true
 SKIP_NMAP=false; SKIP_AMASS=false;  ONLY_MODE=false
 RESUME_MODE=false; JSON_OUTPUT=false
@@ -277,6 +277,7 @@ for arg in "${@:2}"; do
     --skip-favicon)       RUN_FAVICON=false ;;
     --skip-asn)           RUN_ASN=false ;;
     --skip-dirbrute)      RUN_DIRBRUTE=false ;;
+    --skip-403bypass)     RUN_403BYPASS=false ;;  
     --skip-params)        RUN_PARAMS=false ;;
     --skip-cloud)         RUN_CLOUD=false ;;
     --skip-vulnhelper)    RUN_VULNHELPER=false ;;
@@ -288,7 +289,7 @@ for arg in "${@:2}"; do
         RUN_JS=false; RUN_JSDEEP=false; RUN_SECRETS=false;      RUN_TAKEOVER=false
         RUN_NUCLEI=false; RUN_SCREENSHOTS=false
         RUN_HEADERS=false; RUN_TECHFP=false; RUN_FAVICON=false
-        RUN_ASN=false; RUN_DIRBRUTE=false; RUN_PARAMS=false
+        RUN_ASN=false; RUN_DIRBRUTE=false;  RUN_403BYPASS=false; RUN_PARAMS=false
         RUN_CLOUD=false; RUN_VULNHELPER=false
         ONLY_MODE=true
       fi
@@ -312,6 +313,7 @@ for arg in "${@:2}"; do
         favicon)     RUN_FAVICON=true ;;
         asn)         RUN_ASN=true ;;
         dirbrute)    RUN_DIRBRUTE=true ;;
+        403bypass)   RUN_403BYPASS=true ;; 
         params)      RUN_PARAMS=true ;;
         cloud)       RUN_CLOUD=true ;;
         vulnhelper)  RUN_VULNHELPER=true ;;
@@ -537,7 +539,7 @@ declare -A PHASE_FLAGS=(
   [jsdeep]="$RUN_JSDEEP"  [secrets]="$RUN_SECRETS"   [takeover]="$RUN_TAKEOVER"
   [nuclei]="$RUN_NUCLEI"  [screenshots]="$RUN_SCREENSHOTS" [headers]="$RUN_HEADERS"
   [techfp]="$RUN_TECHFP"  [favicon]="$RUN_FAVICON"   [asn]="$RUN_ASN"
-  [dirbrute]="$RUN_DIRBRUTE" [params]="$RUN_PARAMS"  [cloud]="$RUN_CLOUD"
+  [dirbrute]="$RUN_DIRBRUTE" [bypass403]="$RUN_403BYPASS" [params]="$RUN_PARAMS"  [cloud]="$RUN_CLOUD"
   [vulnhelper]="$RUN_VULNHELPER"
 )
 for pi in \
@@ -560,6 +562,7 @@ for pi in \
   "favicon:16:Favicon Hash Hunt" \
   "asn:17:ASN & Network Intel" \
   "dirbrute:18:Content Discovery (ffuf)" \
+  "bypass403:18b:403 Bypass + Path Merge" \
   "params:19:Parameter Enumeration (arjun)" \
   "cloud:20:Cloud Enumeration (s3/azure/gcp)" \
   "vulnhelper:21:Vulnerability Helpers (gf+qsreplace)"; do
@@ -1171,7 +1174,7 @@ phase_asn() {
   fi
 }
 
-# ── Phase 18 — Content Discovery (NEW) ──
+# ── Phase 18 — Content Discovery (ffuf only) ──
 phase_dirbrute() {
   WORDLIST="${DIRBRUTE_WORDLIST:-/usr/share/seclists/Discovery/Web-Content/common.txt}"
 
@@ -1193,7 +1196,6 @@ phase_dirbrute() {
 
   mkdir -p dirbrute
 
-  # ffuf gets its own rate (faster than global recon rate)
   FFUF_RATE="${FFUF_RATE:-200}"
   info "ffuf rate: ${FFUF_RATE} req/s  (override with FFUF_RATE=N)"
 
@@ -1208,7 +1210,6 @@ phase_dirbrute() {
 
     info "[$current/$total_urls] ffuf → $url"
 
-    # Run ffuf in a subshell so set -e doesn't abort on non-zero exit
     (
       set +e
       ffuf -u "${url}/FUZZ" \
@@ -1229,6 +1230,13 @@ phase_dirbrute() {
     )
   done < web/live_urls.txt
 
+  success "ffuf scans complete. JSON results in dirbrute/"
+}
+
+# ── Phase 18b — 403 Bypass + Path Merge + High-Value Filter ──
+phase_403bypass() {
+  mkdir -p dirbrute
+
   # ── Merge: paths only ──
   : > dirbrute/all_found_paths.txt
   for jfile in dirbrute/*.json; do
@@ -1247,7 +1255,7 @@ phase_dirbrute() {
   done
   sort -u dirbrute/all_found_with_status.txt -o dirbrute/all_found_with_status.txt 2>/dev/null || true
 
-  # ── High-value finds (expanded) ──
+  # ── High-value finds ──
   grep -iE \
     "(\.env|\.git|\.gitignore|\.svn|\.DS_Store|backup|config|admin|swagger|openapi|phpinfo|\.sql|\.zip|\.bak|\.tar\.gz?|wp-admin|phpmyadmin|api-docs|actuator|debug|console|\.key|\.pem|\.p12|\.pfx|\.crt|\.cer)" \
     dirbrute/all_found_paths.txt > dirbrute/high_value.txt 2>/dev/null \
@@ -1496,6 +1504,7 @@ run_phase "techfp"      "PHASE 15 — TECH FINGERPRINTING"                 "$RUN
 run_phase "favicon"     "PHASE 16 — FAVICON HASH HUNT"                   "$RUN_FAVICON"     phase_favicon
 run_phase "asn"         "PHASE 17 — ASN & NETWORK INTEL"                 "$RUN_ASN"         phase_asn
 run_phase "dirbrute"    "PHASE 18 — CONTENT DISCOVERY"                   "$RUN_DIRBRUTE"    phase_dirbrute
+run_phase "bypass403"   "PHASE 18b — 403 BYPASS + PATH MERGE"            "$RUN_403BYPASS"   phase_403bypass 
 run_phase "params"      "PHASE 19 — PARAMETER ENUMERATION"               "$RUN_PARAMS"      phase_params
 run_phase "cloud"       "PHASE 20 — CLOUD ENUMERATION"                   "$RUN_CLOUD"       phase_cloud
 run_phase "vulnhelper"  "PHASE 21 — VULNERABILITY HELPERS"               "$RUN_VULNHELPER"  phase_vulnhelper
