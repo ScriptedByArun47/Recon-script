@@ -13,9 +13,18 @@
 #   --scope FILE        Only keep subdomains matching patterns in FILE
 #   --rate-limit N      Global req/s cap (default: 50)
 #
+# TARGETING:
+#   -u, --url HOST      Restrict Phase 8 (port scan) to a single host —
+#                        combine with --only-ports for a standalone scan:
+#                          ./penturion.sh target.com --only-ports -u sub.target.com
+#
 # FEATURE FLAGS:
 #   --mutate            Enable Phase 4 subdomain mutation (opt-in)
-#   --json              Write machine-readable summary.json
+#   --json              Write/continuously update summary.json for the live
+#                        recon dashboard — refreshed before and after every
+#                        phase (status: pending/running/done + live stats)
+#   --deep-nuclei        Phase 12 also runs tech/CVE/JS-endpoint/swagger
+#                        passes (slower). Default is a fast basic pass.
 #   --install-deps      Install all tools then exit
 #
 # SKIP FLAGS:
@@ -39,6 +48,7 @@
 #   --skip-favicon      Phase 16 — Favicon Hash Hunt
 #   --skip-asn          Phase 17 — ASN & Network Intel
 #   --skip-dirbrute     Phase 18 — Content Discovery
+#   --skip-403bypass    Phase 18b — 403 Bypass + Path Merge
 #   --skip-params       Phase 19 — Parameter Enumeration
 #   --skip-cloud        Phase 20 — Cloud Enumeration
 #   --skip-vulnhelper   Phase 21 — Vulnerability Helpers
@@ -50,7 +60,7 @@
 #   --only-js | --only-jsdeep | --only-secrets | --only-takeover
 #   --only-nuclei | --only-screenshots | --only-headers
 #   --only-techfp | --only-favicon | --only-asn | --only-dirbrute
-#   --only-params | --only-cloud | --only-vulnhelper
+#   --only-403bypass | --only-params | --only-cloud | --only-vulnhelper
 #
 # ENV VARS:
 #   SHODAN_API_KEY        Shodan API key
@@ -60,6 +70,7 @@
 #   SECRETFINDER_PYTHON   Python binary for SecretFinder (default: python3)
 #   DIRBRUTE_WORDLIST     Wordlist for ffuf (default: seclists common.txt)
 #   PARAMS_WORDLIST       Wordlist for arjun
+#   FFUF_RATE             ffuf req/s (default: 200)
 #
 # EXAMPLES:
 #   ./penturion.sh target.com
@@ -68,6 +79,8 @@
 #   ./penturion.sh target.com --mutate --json
 #   ./penturion.sh target.com --only-dirbrute --only-params
 #   ./penturion.sh target.com --skip-nmap --skip-amass --skip-mutation
+#   ./penturion.sh target.com --only-ports -u sub.target.com
+#   ./penturion.sh target.com --deep-nuclei
 #   ./penturion.sh --install-deps
 # ============================================================
 
@@ -201,12 +214,17 @@ BASE="recon/$domain"
 CHECKPOINT_FILE="$BASE/.checkpoint"
 LOCK_FILE="$BASE/.lock"
 
+# Ordered list of every phase key, in execution order — used by checkpoint
+# status display AND by the live summary.json generator below.
+PHASE_KEYS="whois passive dns mutation resolve httpx waf ports js jsdeep secrets takeover nuclei screenshots headers techfp favicon asn dirbrute bypass403 params cloud vulnhelper"
+CURRENT_PHASE=""   # set by run_phase() while a phase body is executing
+
 checkpoint_done()  { mkdir -p "$BASE"; grep -qx "$1" "$CHECKPOINT_FILE" 2>/dev/null || echo "$1" >> "$CHECKPOINT_FILE"; }
 checkpoint_check() { grep -qx "$1" "$CHECKPOINT_FILE" 2>/dev/null; }
 checkpoint_clear() { rm -f "$CHECKPOINT_FILE"; success "Checkpoint cleared."; }
 
 checkpoint_status() {
-  local phases=(whois passive dns mutation resolve httpx waf ports js jsdeep secrets takeover nuclei screenshots headers techfp favicon asn dirbrute params cloud vulnhelper)
+  local phases=(whois passive dns mutation resolve httpx waf ports js jsdeep secrets takeover nuclei screenshots headers techfp favicon asn dirbrute bypass403 params cloud vulnhelper)
   local labels=(
     "1   WHOIS & IP Intel"        "2   Passive Enumeration"     "3   DNS Deep Dive"
     "4   Mutation"                "5   Active Resolution"        "6   Live Host / httpx"
@@ -214,8 +232,8 @@ checkpoint_status() {
     "9b  JS Deep Analysis"        "10  Secret Scanning"          "11  Subdomain Takeover"
     "12  Nuclei Vulns"            "13  Screenshots"              "14  CORS & Header Audit"
     "15  Tech Fingerprint"        "16  Favicon Hash Hunt"        "17  ASN & Network Intel"
-    "18  Content Discovery"       "19  Parameter Enumeration"    "20  Cloud Enumeration"
-    "21  Vulnerability Helpers"
+    "18  Content Discovery"       "18b Bypass403 + Merge"        "19  Parameter Enumeration"
+    "20  Cloud Enumeration"       "21  Vulnerability Helpers"
   )
   echo -e "\n${BOLD}Checkpoint status for: $domain${RESET}"
   [ ! -f "$CHECKPOINT_FILE" ] && echo -e "  ${YELLOW}No checkpoint found.${RESET}" && return
@@ -242,46 +260,59 @@ RUN_HEADERS=true; RUN_TECHFP=true;  RUN_FAVICON=true
 RUN_ASN=true;    RUN_DIRBRUTE=true;  RUN_403BYPASS=true; RUN_PARAMS=true
 RUN_CLOUD=true;  RUN_VULNHELPER=true
 SKIP_NMAP=false; SKIP_AMASS=false;  ONLY_MODE=false
-RESUME_MODE=false; JSON_OUTPUT=false
+RESUME_MODE=false; JSON_OUTPUT=false; DEEP_NUCLEI=false
 SCOPE_FILE=""; RATE_LIMIT=50
+PORT_TARGET=""
 
 # ─────────────────────────────────────────
 # PARSE FLAGS
+# (index-based loop — needed because -u/--url consumes a second token)
 # ─────────────────────────────────────────
-for arg in "${@:2}"; do
+ARGS=("${@:2}")
+i=0
+while [ $i -lt ${#ARGS[@]} ]; do
+  arg="${ARGS[$i]}"
   case $arg in
-    --resume)             RESUME_MODE=true ;;
-    --reset)              checkpoint_clear; exit 0 ;;
-    --status)             checkpoint_status; exit 0 ;;
-    --mutate)             RUN_MUTATION=true ;;
-    --json)               JSON_OUTPUT=true ;;
-    --scope=*)            SCOPE_FILE="${arg#--scope=}" ;;
-    --rate-limit=*)       RATE_LIMIT="${arg#--rate-limit=}" ;;
-    --skip-whois)         RUN_WHOIS=false ;;
-    --skip-passive)       RUN_PASSIVE=false ;;
-    --skip-dns)           RUN_DNS=false ;;
-    --skip-mutation)      RUN_MUTATION=false ;;
-    --skip-resolve)       RUN_RESOLVE=false ;;
-    --skip-httpx)         RUN_HTTPX=false ;;
-    --skip-waf)           RUN_WAF=false ;;
-    --skip-ports)         RUN_PORTS=false ;;
-    --skip-nmap)          SKIP_NMAP=true ;;
-    --skip-js)            RUN_JS=false ;;
-    --skip-jsdeep)        RUN_JSDEEP=false ;;
-    --skip-secrets)       RUN_SECRETS=false ;;
-    --skip-takeover)      RUN_TAKEOVER=false ;;
-    --skip-nuclei)        RUN_NUCLEI=false ;;
-    --skip-screenshots)   RUN_SCREENSHOTS=false ;;
-    --skip-headers)       RUN_HEADERS=false ;;
-    --skip-techfp)        RUN_TECHFP=false ;;
-    --skip-favicon)       RUN_FAVICON=false ;;
-    --skip-asn)           RUN_ASN=false ;;
-    --skip-dirbrute)      RUN_DIRBRUTE=false ;;
-    --skip-403bypass)     RUN_403BYPASS=false ;;  
-    --skip-params)        RUN_PARAMS=false ;;
-    --skip-cloud)         RUN_CLOUD=false ;;
-    --skip-vulnhelper)    RUN_VULNHELPER=false ;;
-    --skip-amass)         SKIP_AMASS=true ;;
+    -u|--url)
+      i=$((i + 1))
+      PORT_TARGET="${ARGS[$i]:-}"
+      [ -z "$PORT_TARGET" ] && { error "-u/--url requires a value, e.g. -u sub.target.com"; exit 1; }
+      ;;
+    -u=*)                  PORT_TARGET="${arg#-u=}" ;;
+    --url=*)               PORT_TARGET="${arg#--url=}" ;;
+    --resume)              RESUME_MODE=true ;;
+    --reset)               checkpoint_clear; exit 0 ;;
+    --status)              checkpoint_status; exit 0 ;;
+    --mutate)               RUN_MUTATION=true ;;
+    --json)                JSON_OUTPUT=true ;;
+    --deep-nuclei)          DEEP_NUCLEI=true ;;
+    --scope=*)              SCOPE_FILE="${arg#--scope=}" ;;
+    --rate-limit=*)         RATE_LIMIT="${arg#--rate-limit=}" ;;
+    --skip-whois)           RUN_WHOIS=false ;;
+    --skip-passive)         RUN_PASSIVE=false ;;
+    --skip-dns)             RUN_DNS=false ;;
+    --skip-mutation)        RUN_MUTATION=false ;;
+    --skip-resolve)         RUN_RESOLVE=false ;;
+    --skip-httpx)           RUN_HTTPX=false ;;
+    --skip-waf)             RUN_WAF=false ;;
+    --skip-ports)           RUN_PORTS=false ;;
+    --skip-nmap)            SKIP_NMAP=true ;;
+    --skip-js)              RUN_JS=false ;;
+    --skip-jsdeep)          RUN_JSDEEP=false ;;
+    --skip-secrets)         RUN_SECRETS=false ;;
+    --skip-takeover)        RUN_TAKEOVER=false ;;
+    --skip-nuclei)          RUN_NUCLEI=false ;;
+    --skip-screenshots)     RUN_SCREENSHOTS=false ;;
+    --skip-headers)         RUN_HEADERS=false ;;
+    --skip-techfp)          RUN_TECHFP=false ;;
+    --skip-favicon)         RUN_FAVICON=false ;;
+    --skip-asn)             RUN_ASN=false ;;
+    --skip-dirbrute)        RUN_DIRBRUTE=false ;;
+    --skip-403bypass)       RUN_403BYPASS=false ;;
+    --skip-params)          RUN_PARAMS=false ;;
+    --skip-cloud)           RUN_CLOUD=false ;;
+    --skip-vulnhelper)      RUN_VULNHELPER=false ;;
+    --skip-amass)           SKIP_AMASS=true ;;
     --only-*)
       if [ "$ONLY_MODE" = false ]; then
         RUN_WHOIS=false; RUN_PASSIVE=false; RUN_DNS=false;      RUN_MUTATION=false
@@ -313,7 +344,7 @@ for arg in "${@:2}"; do
         favicon)     RUN_FAVICON=true ;;
         asn)         RUN_ASN=true ;;
         dirbrute)    RUN_DIRBRUTE=true ;;
-        403bypass)   RUN_403BYPASS=true ;; 
+        403bypass)   RUN_403BYPASS=true ;;
         params)      RUN_PARAMS=true ;;
         cloud)       RUN_CLOUD=true ;;
         vulnhelper)  RUN_VULNHELPER=true ;;
@@ -321,6 +352,7 @@ for arg in "${@:2}"; do
       esac ;;
     *) warn "Unknown flag: $arg" ;;
   esac
+  i=$((i + 1))
 done
 
 if ! [[ "$RATE_LIMIT" =~ ^[0-9]+$ ]]; then
@@ -467,6 +499,102 @@ run_nmap() {
 }
 
 # ─────────────────────────────────────────
+# LIVE SUMMARY.JSON (for the recon dashboard)
+# Gated behind --json. Called by run_phase() before AND after every
+# phase body, so the dashboard sees "running" mid-phase, not just
+# "done" after the fact. All paths below are relative to $BASE
+# (this is only ever called after `cd "$BASE"`).
+# ─────────────────────────────────────────
+countl() { [ -f "$1" ] && wc -l < "$1" 2>/dev/null | tr -d ' ' || echo 0; }
+
+phase_log_line() {
+  case "$1" in
+    whois)       [ -s whois/a_records.txt ] && echo "Root IP: $(head -1 whois/a_records.txt 2>/dev/null)" || echo "" ;;
+    passive)     echo "Passive subdomains: $(countl passive/all_passive.txt)" ;;
+    dns)         [ -s dns/email_security_eval.txt ] && tail -n 1 dns/email_security_eval.txt 2>/dev/null || echo "" ;;
+    mutation)    echo "Mutated candidates: $(countl active/mutated.txt)" ;;
+    resolve)     echo "Final resolved subdomains: $(countl active/final_subdomains.txt)" ;;
+    httpx)       echo "Live hosts: $(countl web/live_hosts.txt)" ;;
+    waf)         echo "WAF probes: $(countl web/waf_results_raw.json)" ;;
+    ports)       echo "Open ports: $(countl ports/all_open_ports.txt)" ;;
+    js)          echo "JS files: $(countl js/all_js_files.txt) | Endpoints: $(countl js/interesting_endpoints.txt)" ;;
+    jsdeep)      echo "Sensitive endpoints: $(countl js/js_sensitive_endpoints.txt) | Secrets: $(countl secrets/js_hardcoded_secrets.txt)" ;;
+    secrets)     echo "Credential patterns: $(countl secrets/credential_patterns.txt)" ;;
+    takeover)    echo "Manual takeover flags: $(countl vulns/takeover_manual.txt)" ;;
+    nuclei)      echo "Nuclei findings: $(countl vulns/nuclei_results.txt)" ;;
+    screenshots) [ -f screenshots/gowitness.db ] && echo "Screenshots captured" || echo "No screenshots yet" ;;
+    headers)     echo "CORS issues: $(countl headers/cors_vulns.txt) | Missing headers: $(countl headers/missing_headers.txt)" ;;
+    techfp)      echo "Detected versions: $(countl techfp/detected_versions.txt)" ;;
+    favicon)     echo "Favicon hashes: $(countl whois/favicon_hashes.txt)" ;;
+    asn)         echo "IP ranges in ASN: $(countl asn/ip_ranges.txt)" ;;
+    dirbrute)    echo "ffuf result files: $(ls dirbrute/*.json 2>/dev/null | wc -l | tr -d ' ')" ;;
+    bypass403)   echo "High value paths: $(countl dirbrute/high_value.txt) | 403 bypass: $(countl dirbrute/bypass_found.txt)" ;;
+    params)      echo "gf param matches: $(countl params/all_gf_params.txt)" ;;
+    cloud)       echo "Open buckets — S3:$(countl cloud/s3_open_buckets.txt) Azure:$(countl cloud/azure_blobs.txt) GCP:$(countl cloud/gcp_buckets.txt)" ;;
+    vulnhelper)  echo "XSS candidates: $(countl vulnhelpers/xss_candidates.txt) | SQLi candidates: $(countl vulnhelpers/sqli_candidates.txt)" ;;
+    *)           echo "" ;;
+  esac
+}
+
+generate_summary() {
+  [ "$JSON_OUTPUT" = true ] || return 0
+  command -v jq &>/dev/null || return 0
+
+  local phases_json
+  phases_json=$(
+    for p in $PHASE_KEYS; do
+      local st logline
+      if [ -n "${CURRENT_PHASE:-}" ] && [ "$p" = "$CURRENT_PHASE" ]; then
+        st="running"
+      elif checkpoint_check "$p"; then
+        st="done"
+      else
+        st="pending"
+      fi
+      logline=$(phase_log_line "$p" 2>/dev/null || echo "")
+      jq -n --arg k "$p" --arg s "$st" --arg l "$logline" \
+        '{key:$k, value:{status:$s, log:(if $l == "" then [] else [$l] end)}}' 2>/dev/null
+    done | jq -s 'from_entries' 2>/dev/null
+  )
+  [ -z "$phases_json" ] && phases_json='{}'
+
+  local crit high med subdomains live secrets_ct openports elapsed_s elapsed
+  crit=$(grep -ic '\[critical\]' vulns/nuclei_results.txt 2>/dev/null || echo 0)
+  high=$(grep -ic '\[high\]'     vulns/nuclei_results.txt 2>/dev/null || echo 0)
+  med=$(grep -ic  '\[medium\]'   vulns/nuclei_results.txt 2>/dev/null || echo 0)
+  subdomains=$(countl active/final_subdomains.txt)
+  live=$(countl web/live_hosts.txt)
+  secrets_ct=$(( $(countl secrets/js_hardcoded_secrets.txt) + $(countl secrets/credential_patterns.txt) ))
+  openports=$(countl ports/all_open_ports.txt)
+  elapsed_s=$(( $(date +%s) - ${START_TIME:-$(date +%s)} ))
+  elapsed="$((elapsed_s/3600))h $(((elapsed_s%3600)/60))m $((elapsed_s%60))s"
+
+  jq -n \
+    --arg target "$domain" \
+    --arg generated "$(date -u -Iseconds)" \
+    --argjson phases "$phases_json" \
+    --argjson subdomains "$subdomains" \
+    --argjson live "$live" \
+    --argjson crit "$crit" --argjson high "$high" --argjson med "$med" \
+    --argjson secrets "$secrets_ct" \
+    --argjson openports "$openports" \
+    --arg elapsed "$elapsed" \
+    '{
+      target: $target,
+      generated: $generated,
+      phases: $phases,
+      stats: {
+        subdomains: $subdomains,
+        live_hosts: $live,
+        vulns: {critical:$crit, high:$high, medium:$med},
+        secrets: $secrets,
+        open_ports: $openports,
+        elapsed: $elapsed
+      }
+    }' > summary.json 2>/dev/null || warn "Failed to write summary.json"
+}
+
+# ─────────────────────────────────────────
 # PHASE RUNNER
 # ─────────────────────────────────────────
 run_phase() {
@@ -478,8 +606,12 @@ run_phase() {
     skip "$label"; return 0
   fi
   banner "$label"
+  CURRENT_PHASE="$key"
+  generate_summary          # mark this phase "running" before it starts
   "$body_fn"
+  CURRENT_PHASE=""
   checkpoint_done "$key"
+  generate_summary          # mark it "done" (+ refresh live stats) right after
   echo -e "${MAGENTA}[✓]${RESET} Checkpoint: $key"
 }
 
@@ -527,6 +659,8 @@ echo "$domain" > .target
 date -u > .start_time
 [ -n "$SCOPE_FILE" ] && info "Scope: $SCOPE_FILE" || info "No scope file — all subdomains in scope"
 info "Rate limit: ${RATE_LIMIT} req/s | Output: $(pwd)"
+[ -n "$PORT_TARGET" ] && info "Single port-scan target (-u/--url): $PORT_TARGET"
+[ "$JSON_OUTPUT" = true ] && info "Live summary.json enabled — dashboard can poll this directory"
 
 # ─────────────────────────────────────────
 # PHASE PLAN DISPLAY
@@ -550,12 +684,12 @@ for pi in \
   "resolve:5 :Active Resolution" \
   "httpx:6 :Live Host Detection" \
   "waf:7 :WAF Detection" \
-  "ports:8 :Port Scanning" \
+  "ports:8 :Port Scanning$([ -n "$PORT_TARGET" ] && echo " (single-target: $PORT_TARGET)")" \
   "js:9 :JS & Endpoint Discovery" \
   "jsdeep:9b:JS Deep Analysis" \
   "secrets:10:Secret Scanning" \
   "takeover:11:Subdomain Takeover" \
-  "nuclei:12:Nuclei Vuln Scanning" \
+  "nuclei:12:Nuclei Vuln Scanning$([ "$DEEP_NUCLEI" = true ] && echo " (deep)" || echo " (basic)")" \
   "screenshots:13:Screenshots" \
   "headers:14:CORS & Header Audit" \
   "techfp:15:Tech Fingerprinting" \
@@ -577,6 +711,10 @@ for pi in \
   fi
 done
 echo ""
+
+# Seed summary.json immediately (all pending / resumed state) so a
+# dashboard connecting before Phase 1 finishes still sees something.
+generate_summary
 
 # ════════════════════════════════════════════════════════════
 # PHASE BODIES
@@ -791,14 +929,31 @@ phase_waf() {
   success "WAF results: $(wc -l < web/waf_results_raw.json 2>/dev/null || echo 0) entries"
 }
 
-# ── Phase 8 — Port Scanning ──
+# ── Phase 8 — Port Scanning (supports -u/--url single-target mode) ──
 phase_ports() {
-  naabu -l active/final_subdomains.txt -top-ports 1000 \
+  local target_list="active/final_subdomains.txt"
+  local web_list="web/non_cdn_hosts.txt"
+  local single_mode=false
+  local clean_target=""
+
+  if [ -n "$PORT_TARGET" ]; then
+    single_mode=true
+    # strip scheme + path if a full URL was pasted, keep just host[:port]
+    clean_target=$(echo "$PORT_TARGET" | sed -E 's#^[a-zA-Z]+://##; s#[/].*$##')
+    info "Single-target mode (-u/--url): scanning only $clean_target — skipping the full host list"
+
+    mkdir -p ports
+    target_list="ports/.single_target.txt"
+    web_list="ports/.single_target.txt"
+    echo "$clean_target" > "$target_list"
+  fi
+
+  naabu -l "$target_list" -top-ports 1000 \
     -rate "$RATE_LIMIT" -silent 2>/dev/null \
     | httpx -silent -title -sc -rl "$RATE_LIMIT" \
     -o ports/web_ports_top1000.txt 2>/dev/null || touch ports/web_ports_top1000.txt
 
-  naabu -l web/non_cdn_hosts.txt -p - \
+  naabu -l "$web_list" -p - \
     -rate "$((RATE_LIMIT * 40))" -silent 2>/dev/null \
     > ports/all_open_ports.txt || touch ports/all_open_ports.txt
 
@@ -821,13 +976,15 @@ phase_ports() {
       run_nmap -p 80,443,8080,8443,8000,8888 \
         --script http-enum,http-title,http-headers,http-methods \
         "$host" -oN "ports/web_enum_${safe}.txt" 2>/dev/null || warn "nmap http-enum failed: $host"
-    done < web/non_cdn_hosts.txt
+    done < "$web_list"
   else
     warn "Nmap skipped (--skip-nmap)"
   fi
+
+  [ "$single_mode" = true ] && success "Single-target port scan complete for: $clean_target"
 }
 
-# ── Phase 9 — JS & Endpoint Discovery ──
+# ── Phase 9 — JS & Endpoint Discovery (+ background JS download) ──
 phase_js() {
   local GAU_TMPDIR
   GAU_TMPDIR=$(mktemp -d)
@@ -859,23 +1016,63 @@ phase_js() {
     js/all_urls.txt | sort -u > js/sensitive_paths.txt
 
   success "JS files: $(wc -l < js/all_js_files.txt) | Endpoints: $(wc -l < js/interesting_endpoints.txt)"
+
+  # ── Kick off JS download in the background the moment the file list exists ──
+  # Doesn't block Phase 9 from returning — Phase 9b waits for it before analyzing.
+  start_js_background_download
 }
 
-# ── Phase 9b — JS Deep Analysis ──
+# ── Background JS downloader — launched from phase_js, awaited in phase_jsdeep ──
+start_js_background_download() {
+  mkdir -p js/downloaded
+  rm -f js/.download_pid js/.download_complete
+
+  local total
+  total=$(wc -l < js/all_js_files.txt 2>/dev/null | tr -d ' ' || echo 0)
+
+  if [ "$total" -eq 0 ]; then
+    touch js/.download_complete
+    info "No JS files to download."
+    return
+  fi
+
+  (
+    local DL_CONCURRENCY=10 DL_JOBS=0
+    while IFS= read -r jsurl; do
+      [ -z "$jsurl" ] && continue
+      (
+        status=$(curl -o /dev/null -s -w "%{http_code}" --max-time 10 "$jsurl" 2>/dev/null || echo "000")
+        if [ "$status" = "200" ]; then
+          safe=$(printf '%s' "$jsurl" | md5sum | cut -d' ' -f1)
+          curl -sk --max-time 10 "$jsurl" -o "js/downloaded/${safe}.js" 2>/dev/null || true
+        fi
+      ) &
+      DL_JOBS=$((DL_JOBS + 1))
+      if [ "$DL_JOBS" -ge "$DL_CONCURRENCY" ]; then wait; DL_JOBS=0; fi
+    done < js/all_js_files.txt
+    wait
+    touch js/.download_complete
+  ) &
+
+  echo $! > js/.download_pid
+  info "JS download started in background (PID $(cat js/.download_pid), $total files) — Phase 9b will wait for it before analyzing"
+}
+
+# ── Phase 9b — JS Deep Analysis (extraction only — download already ran in Phase 9) ──
 phase_jsdeep() {
-  info "Downloading $(wc -l < js/all_js_files.txt 2>/dev/null || echo 0) JS files..."
-  while IFS= read -r jsurl; do
-    [ -z "$jsurl" ] && continue
-    status=$(curl -o /dev/null -s -w "%{http_code}" --max-time 10 "$jsurl" 2>/dev/null || echo "000")
-    if [ "$status" = "200" ]; then
-      safe=$(printf '%s' "$jsurl" | md5sum | cut -d' ' -f1)
-      curl -sk --max-time 10 "$jsurl" -o "js/downloaded/${safe}.js" 2>/dev/null || true
+  # ── Wait for the background downloader launched in phase_js ──
+  if [ -f js/.download_pid ] && [ ! -f js/.download_complete ]; then
+    DPID=$(cat js/.download_pid 2>/dev/null || echo "")
+    if [ -n "$DPID" ] && kill -0 "$DPID" 2>/dev/null; then
+      info "Waiting for background JS download to finish (PID $DPID)..."
+      wait "$DPID" 2>/dev/null || true
     fi
-  done < js/all_js_files.txt
+  fi
 
   DOWNLOADED=$(find js/downloaded -name "*.js" -size +0c 2>/dev/null | wc -l || echo 0)
-  success "Downloaded: $DOWNLOADED JS files"
+  success "Downloaded: $DOWNLOADED JS files (ran in background during Phase 9)"
 
+  # ── Endpoint / secret / GraphQL extraction — the only thing left in this phase ──
   grep -rhEo \
     "(['\"])(\/[a-zA-Z0-9_/?=&.%-]{3,})(['\"])|(https?:\/\/[a-zA-Z0-9._/-]+)" \
     js/downloaded/ 2>/dev/null \
@@ -961,25 +1158,32 @@ phase_takeover() {
   fi
 }
 
-# ── Phase 12 — Nuclei Vuln Scanning ──
+# ── Phase 12 — Nuclei Vuln Scanning (basic pass by default, --deep-nuclei for full) ──
 phase_nuclei() {
   if ! command -v nuclei &>/dev/null; then
     warn "nuclei not installed."; touch vulns/nuclei_results.txt; return
   fi
-  nuclei -l web/live_urls.txt -s critical,high,medium -stats \
-    -rl "$RATE_LIMIT" -o vulns/nuclei_results.txt 2>/dev/null || touch vulns/nuclei_results.txt
-  nuclei -l web/live_urls.txt -t technologies/ \
-    -rl "$RATE_LIMIT" -o vulns/nuclei_tech.txt 2>/dev/null || true
-  nuclei -l web/live_urls.txt -tags cve -s critical,high \
-    -rl "$RATE_LIMIT" -o vulns/nuclei_cves.txt 2>/dev/null || touch vulns/nuclei_cves.txt
-  if [ -s js/js_sensitive_endpoints.txt ]; then
-    nuclei -l js/js_sensitive_endpoints.txt -s critical,high \
-      -rl "$RATE_LIMIT" -o vulns/nuclei_js_endpoints.txt 2>/dev/null || touch vulns/nuclei_js_endpoints.txt
-  fi
-  # Swagger/OpenAPI hunting
-  nuclei -l web/live_urls.txt -tags swagger,openapi \
-    -rl "$RATE_LIMIT" -o vulns/nuclei_api_specs.txt 2>/dev/null || touch vulns/nuclei_api_specs.txt
+
+  nuclei -l web/live_urls.txt -s critical,high \
+    -tags exposure,misconfig,default-login,panel,tech \
+    -rl "$RATE_LIMIT" -timeout 5 -silent \
+    -o vulns/nuclei_results.txt 2>/dev/null || touch vulns/nuclei_results.txt
   success "Nuclei findings: $(wc -l < vulns/nuclei_results.txt 2>/dev/null || echo 0)"
+
+  if [ "$DEEP_NUCLEI" = true ]; then
+    info "Deep nuclei pass (--deep-nuclei)..."
+    nuclei -l web/live_urls.txt -t technologies/ \
+      -rl "$RATE_LIMIT" -o vulns/nuclei_tech.txt 2>/dev/null || true
+    nuclei -l web/live_urls.txt -tags cve -s critical,high \
+      -rl "$RATE_LIMIT" -o vulns/nuclei_cves.txt 2>/dev/null || touch vulns/nuclei_cves.txt
+    if [ -s js/js_sensitive_endpoints.txt ]; then
+      nuclei -l js/js_sensitive_endpoints.txt -s critical,high \
+        -rl "$RATE_LIMIT" -o vulns/nuclei_js_endpoints.txt 2>/dev/null || touch vulns/nuclei_js_endpoints.txt
+    fi
+    nuclei -l web/live_urls.txt -tags swagger,openapi \
+      -rl "$RATE_LIMIT" -o vulns/nuclei_api_specs.txt 2>/dev/null || touch vulns/nuclei_api_specs.txt
+    success "Deep nuclei: tech $(wc -l < vulns/nuclei_tech.txt 2>/dev/null || echo 0) | CVEs $(wc -l < vulns/nuclei_cves.txt 2>/dev/null || echo 0)"
+  fi
 }
 
 # ── Phase 13 — Screenshots ──
@@ -1174,7 +1378,7 @@ phase_asn() {
   fi
 }
 
-# ── Phase 18 — Content Discovery (ffuf only) ──
+# ── Phase 18 — Content Discovery (ffuf, parallelized) ──
 phase_dirbrute() {
   WORDLIST="${DIRBRUTE_WORDLIST:-/usr/share/seclists/Discovery/Web-Content/common.txt}"
 
@@ -1196,41 +1400,72 @@ phase_dirbrute() {
 
   mkdir -p dirbrute
 
-  FFUF_RATE="${FFUF_RATE:-200}"
-  info "ffuf rate: ${FFUF_RATE} req/s  (override with FFUF_RATE=N)"
+  local FFUF_RATE="${FFUF_RATE:-200}"                       # req/s PER ffuf process
+  local FFUF_THREADS="${FFUF_THREADS:-20}"                  # -t PER ffuf process
+  local DIRBRUTE_CONCURRENCY="${DIRBRUTE_CONCURRENCY:-10}"  # parallel URLs — min 10
 
-  local total_urls current=0
+  if ! [[ "$DIRBRUTE_CONCURRENCY" =~ ^[0-9]+$ ]] || [ "$DIRBRUTE_CONCURRENCY" -lt 10 ]; then
+    DIRBRUTE_CONCURRENCY=10
+  fi
+
+  local total_urls
   total_urls=$(wc -l < web/live_urls.txt 2>/dev/null | tr -d ' ' || echo 0)
+  info "ffuf: ${DIRBRUTE_CONCURRENCY} URLs in parallel | ${FFUF_RATE} req/s + ${FFUF_THREADS} threads PER url"
+  info "Aggregate ceiling ≈ $((FFUF_RATE * DIRBRUTE_CONCURRENCY)) req/s across ${DIRBRUTE_CONCURRENCY} concurrent targets — lower DIRBRUTE_CONCURRENCY or FFUF_RATE if that's too aggressive"
 
-  while IFS= read -r url; do
-    [ -z "$url" ] && continue
-    current=$((current + 1))
+  local start_ts
+  start_ts=$(date +%s)
+
+  # Runs one ffuf scan for one URL. Called in a backgrounded subshell below —
+  # subshells inherit this function + the caller's variables (WORDLIST,
+  # FFUF_RATE, FFUF_THREADS, colour vars) via bash's normal dynamic scoping.
+  run_one_ffuf() {
+    local url="$1" idx="$2"
+    local safe outfile
     safe=$(printf '%s' "$url" | md5sum | cut -d' ' -f1)
     outfile="dirbrute/${safe}.json"
 
-    info "[$current/$total_urls] ffuf → $url"
+    ffuf -u "${url}/FUZZ" \
+         -w "$WORDLIST" \
+         -mc 200,201,204,301,302,307,401,403,405 \
+         -fc 404 \
+         -t "$FFUF_THREADS" \
+         -rate "$FFUF_RATE" \
+         -o "$outfile" \
+         -of json \
+         -timeout 10 \
+         -c \
+         -s 2>/dev/null
 
-    (
-      set +e
-      ffuf -u "${url}/FUZZ" \
-           -w "$WORDLIST" \
-           -mc 200,201,204,301,302,307,401,403,405 \
-           -fc 404 \
-           -t 50 \
-           -rate "$FFUF_RATE" \
-           -o "$outfile" \
-           -of json \
-           -timeout 10 \
-           -c \
-           -s 2>/dev/null
-      # Validate JSON — ffuf can write partial JSON on interrupt/timeout
-      if [ -f "$outfile" ]; then
-        jq empty "$outfile" 2>/dev/null || rm -f "$outfile"
-      fi
-    )
+    # Validate JSON — ffuf can write partial JSON on interrupt/timeout
+    if [ -f "$outfile" ]; then
+      jq empty "$outfile" 2>/dev/null || rm -f "$outfile"
+    fi
+
+    if [ -f "$outfile" ]; then
+      echo -e "${GREEN}[+]${RESET} [$idx/$total_urls] done  → $url"
+    else
+      echo -e "${YELLOW}[!]${RESET} [$idx/$total_urls] empty/invalid → $url"
+    fi
+  }
+
+  local current=0 jobs=0
+  while IFS= read -r url; do
+    [ -z "$url" ] && continue
+    current=$((current + 1))
+
+    ( set +e; run_one_ffuf "$url" "$current" ) &
+
+    jobs=$((jobs + 1))
+    if [ "$jobs" -ge "$DIRBRUTE_CONCURRENCY" ]; then
+      wait
+      jobs=0
+    fi
   done < web/live_urls.txt
+  wait   # drain any remaining background jobs
 
-  success "ffuf scans complete. JSON results in dirbrute/"
+  local elapsed=$(( $(date +%s) - start_ts ))
+  success "ffuf scans complete: $current URLs in $((elapsed/60))m $((elapsed%60))s. JSON results in dirbrute/"
 }
 
 # ── Phase 18b — 403 Bypass + Path Merge + High-Value Filter ──
@@ -1296,6 +1531,7 @@ phase_403bypass() {
 
   success "Paths: $(wc -l < dirbrute/all_found_paths.txt) | High value: $(wc -l < dirbrute/high_value.txt) | 403 bypass: $(wc -l < dirbrute/bypass_found.txt)"
 }
+
 # ── Phase 19 — Parameter Enumeration (NEW) ──
 phase_params() {
   mkdir -p params
@@ -1504,7 +1740,7 @@ run_phase "techfp"      "PHASE 15 — TECH FINGERPRINTING"                 "$RUN
 run_phase "favicon"     "PHASE 16 — FAVICON HASH HUNT"                   "$RUN_FAVICON"     phase_favicon
 run_phase "asn"         "PHASE 17 — ASN & NETWORK INTEL"                 "$RUN_ASN"         phase_asn
 run_phase "dirbrute"    "PHASE 18 — CONTENT DISCOVERY"                   "$RUN_DIRBRUTE"    phase_dirbrute
-run_phase "bypass403"   "PHASE 18b — 403 BYPASS + PATH MERGE"            "$RUN_403BYPASS"   phase_403bypass 
+run_phase "bypass403"   "PHASE 18b — 403 BYPASS + PATH MERGE"            "$RUN_403BYPASS"   phase_403bypass
 run_phase "params"      "PHASE 19 — PARAMETER ENUMERATION"               "$RUN_PARAMS"      phase_params
 run_phase "cloud"       "PHASE 20 — CLOUD ENUMERATION"                   "$RUN_CLOUD"       phase_cloud
 run_phase "vulnhelper"  "PHASE 21 — VULNERABILITY HELPERS"               "$RUN_VULNHELPER"  phase_vulnhelper
@@ -1513,6 +1749,9 @@ run_phase "vulnhelper"  "PHASE 21 — VULNERABILITY HELPERS"               "$RUN
 info "Generating reports..."
 bash "$(dirname "$0")/report.sh" "$domain" "$(pwd)" "$JSON_OUTPUT" "$SCOPE_FILE" "$RATE_LIMIT" \
   2>/dev/null || warn "report.sh not found — run manually: ./report.sh $domain $(pwd)"
+
+# Final summary.json refresh — all phases done, final stats
+generate_summary
 
 # ── Notification ──
 if command -v notify &>/dev/null && [ -f ~/.config/notify/provider-config.yaml ]; then
