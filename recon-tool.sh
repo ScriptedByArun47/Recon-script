@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================
-# Recon-tool v7 — Automated Web Recon Framework 
+# Recon-tool v7.0.1 — Automated Web Recon Framework
 # Usage: ./recon-tool.sh target.com [OPTIONS]
 #
 # RESUME / CHECKPOINT:
@@ -13,10 +13,21 @@
 #   --scope FILE        Only keep subdomains matching patterns in FILE
 #   --rate-limit N      Global req/s cap (default: 50)
 #
+# CONCURRENCY:
+#   --max-parallel-phases N   Phases run as a dependency graph — each phase
+#                              launches the moment its deps are satisfied,
+#                              with no artificial phase-by-phase barrier.
+#                              This caps how many phases run AT ONCE
+#                              (default: 6). Each phase's own internal
+#                              parallelism (ffuf threads, gau workers, etc.)
+#                              is separate and stacks on top of this.
+#                              Per-phase output goes to logs/<phase>.log;
+#                              the console only shows start/finish lines.
+#
 # TARGETING:
 #   -u, --url HOST      Restrict Phase 8 (port scan) to a single host —
 #                        combine with --only-ports for a standalone scan:
-#                          ./penturion.sh target.com --only-ports -u sub.target.com
+#                          ./recon-tool.sh target.com --only-ports -u sub.target.com
 #
 # FEATURE FLAGS:
 #   --mutate            Enable Phase 4 subdomain mutation (opt-in)
@@ -88,6 +99,15 @@ set -euo pipefail
 IFS=$'\n\t'
 
 # ─────────────────────────────────────────
+# BASH VERSION CHECK — the phase scheduler needs `wait -n` (bash 4.3+)
+# ─────────────────────────────────────────
+if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3))); then
+  echo "PENTURION v7 requires bash 4.3+ for the parallel phase scheduler (wait -n)." >&2
+  echo "Current version: $BASH_VERSION" >&2
+  exit 1
+fi
+
+# ─────────────────────────────────────────
 # COLOURS
 # ─────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -99,11 +119,24 @@ warn()    { echo -e "${YELLOW}[!]${RESET} $*"; }
 error()   { echo -e "${RED}[-]${RESET} $*"; }
 skip()    { echo -e "${YELLOW}[~]${RESET} Skipping: $*"; }
 resumed() { echo -e "${MAGENTA}[↩]${RESET} Already done (resuming): $*"; }
+failed()  { echo -e "${RED}[✗]${RESET} $*"; }
 banner()  {
   echo -e "\n${BOLD}${GREEN}═══════════════════════════════════════${RESET}"
   echo -e "${BOLD}${GREEN}  $*${RESET}"
   echo -e "${BOLD}${GREEN}═══════════════════════════════════════${RESET}\n"
 }
+
+# ─────────────────────────────────────────
+# PHASE SCHEDULER STATE (global — declared early so the EXIT trap can
+# always safely reference them, even if we're interrupted before the
+# scheduler itself starts running)
+#   STATUS[key]  = pending | running | done | skipped | failed
+#   PIDS[key]    = pid of the running background job for that phase
+#   PID_KEY[pid] = reverse lookup, pid -> key
+# ─────────────────────────────────────────
+declare -A STATUS=()
+declare -A PIDS=()
+declare -A PID_KEY=()
 
 # ─────────────────────────────────────────
 # DEPENDENCY INSTALLER
@@ -216,12 +249,24 @@ LOCK_FILE="$BASE/.lock"
 
 # Ordered list of every phase key, in execution order — used by checkpoint
 # status display AND by the live summary.json generator below.
-PHASE_KEYS="whois passive dns mutation resolve httpx waf ports js jsdeep secrets takeover nuclei screenshots headers techfp favicon asn dirbrute bypass403 params cloud vulnhelper"
-CURRENT_PHASE=""   # set by run_phase() while a phase body is executing
+# NOTE: this is a real bash array, not a space-separated string. The script
+# sets IFS=$'\n\t' near the top (no space), so any `for x in $SOME_STRING`
+# or `read -ra arr <<< "$SOME_STRING"` word-split on this string would
+# silently collapse into a single element instead of 22 — that was the
+# root cause of the old "DEPS[$k]: unbound variable" crash.
+PHASE_KEYS=(whois passive dns mutation resolve httpx waf ports js jsdeep secrets takeover nuclei screenshots headers techfp favicon asn dirbrute bypass403 params cloud vulnhelper)
 
-checkpoint_done()  { mkdir -p "$BASE"; grep -qx "$1" "$CHECKPOINT_FILE" 2>/dev/null || echo "$1" >> "$CHECKPOINT_FILE"; }
+# checkpoint_done is called from multiple concurrently-running phases now,
+# so appends are serialized with flock to avoid interleaved/corrupted writes.
+checkpoint_done()  {
+  mkdir -p "$BASE"
+  (
+    flock -x 200
+    grep -qx "$1" "$CHECKPOINT_FILE" 2>/dev/null || echo "$1" >> "$CHECKPOINT_FILE"
+  ) 200>"${CHECKPOINT_FILE}.lock"
+}
 checkpoint_check() { grep -qx "$1" "$CHECKPOINT_FILE" 2>/dev/null; }
-checkpoint_clear() { rm -f "$CHECKPOINT_FILE"; success "Checkpoint cleared."; }
+checkpoint_clear() { rm -f "$CHECKPOINT_FILE" "${CHECKPOINT_FILE}.lock"; success "Checkpoint cleared."; }
 
 checkpoint_status() {
   local phases=(whois passive dns mutation resolve httpx waf ports js jsdeep secrets takeover nuclei screenshots headers techfp favicon asn dirbrute bypass403 params cloud vulnhelper)
@@ -263,6 +308,7 @@ SKIP_NMAP=false; SKIP_AMASS=false;  ONLY_MODE=false
 RESUME_MODE=false; JSON_OUTPUT=false; DEEP_NUCLEI=false
 SCOPE_FILE=""; RATE_LIMIT=50
 PORT_TARGET=""
+MAX_PARALLEL_PHASES=6
 
 # ─────────────────────────────────────────
 # PARSE FLAGS
@@ -288,6 +334,12 @@ while [ $i -lt ${#ARGS[@]} ]; do
     --deep-nuclei)          DEEP_NUCLEI=true ;;
     --scope=*)              SCOPE_FILE="${arg#--scope=}" ;;
     --rate-limit=*)         RATE_LIMIT="${arg#--rate-limit=}" ;;
+    --max-parallel-phases=*) MAX_PARALLEL_PHASES="${arg#--max-parallel-phases=}" ;;
+    --max-parallel-phases)
+      i=$((i + 1))
+      MAX_PARALLEL_PHASES="${ARGS[$i]:-}"
+      [ -z "$MAX_PARALLEL_PHASES" ] && { error "--max-parallel-phases requires a value"; exit 1; }
+      ;;
     --skip-whois)           RUN_WHOIS=false ;;
     --skip-passive)         RUN_PASSIVE=false ;;
     --skip-dns)             RUN_DNS=false ;;
@@ -358,6 +410,9 @@ done
 if ! [[ "$RATE_LIMIT" =~ ^[0-9]+$ ]]; then
   error "--rate-limit must be a positive integer, got: $RATE_LIMIT"; exit 1
 fi
+if ! [[ "$MAX_PARALLEL_PHASES" =~ ^[0-9]+$ ]] || [ "$MAX_PARALLEL_PHASES" -lt 1 ]; then
+  error "--max-parallel-phases must be a positive integer, got: $MAX_PARALLEL_PHASES"; exit 1
+fi
 
 # ─────────────────────────────────────────
 # SCOPE FILTER — Burp Suite JSON support
@@ -388,7 +443,7 @@ _init_scope() {
     # Burp Suite JSON scope
     if [ ! -f "$SCOPE_PARSER" ]; then
       error "scope_parser.sh not found at $SCOPE_PARSER"
-      error "Place scope_parser.sh next to penturion.sh and retry"
+      error "Place scope_parser.sh next to recon-tool.sh and retry"
       exit 1
     fi
     # shellcheck source=scope_parser.sh
@@ -479,6 +534,11 @@ echo $$ > "$LOCK_FILE"
 CLEANUP_TMPDIRS=()
 cleanup() {
   rm -f "$LOCK_FILE"
+  # Terminate any still-running phase subshells (SIGTERM, not -9, so each
+  # phase's own EXIT traps — e.g. phase_js's tmp-dir cleanup — get to run).
+  for pid in "${!PID_KEY[@]}"; do
+    kill -TERM "$pid" 2>/dev/null || true
+  done
   for d in "${CLEANUP_TMPDIRS[@]:-}"; do [ -d "$d" ] && rm -rf "$d"; done
   echo -e "\n${YELLOW}[!]${RESET} Interrupted. Use --resume to continue."
 }
@@ -542,15 +602,14 @@ generate_summary() {
 
   local phases_json
   phases_json=$(
-    for p in $PHASE_KEYS; do
+    for p in "${PHASE_KEYS[@]}"; do
       local st logline
-      if [ -n "${CURRENT_PHASE:-}" ] && [ "$p" = "$CURRENT_PHASE" ]; then
-        st="running"
-      elif checkpoint_check "$p"; then
-        st="done"
-      else
-        st="pending"
-      fi
+      case "${STATUS[$p]:-pending}" in
+        running)         st="running" ;;
+        done|skipped)    st="done" ;;
+        failed)          st="failed" ;;
+        *)               st="pending" ;;
+      esac
       logline=$(phase_log_line "$p" 2>/dev/null || echo "")
       jq -n --arg k "$p" --arg s "$st" --arg l "$logline" \
         '{key:$k, value:{status:$s, log:(if $l == "" then [] else [$l] end)}}' 2>/dev/null
@@ -595,30 +654,9 @@ generate_summary() {
 }
 
 # ─────────────────────────────────────────
-# PHASE RUNNER
-# ─────────────────────────────────────────
-run_phase() {
-  local key="$1" label="$2" run_flag="$3" body_fn="$4"
-  if [ "$RESUME_MODE" = true ] && checkpoint_check "$key"; then
-    resumed "$label"; return 0
-  fi
-  if [ "$run_flag" = false ]; then
-    skip "$label"; return 0
-  fi
-  banner "$label"
-  CURRENT_PHASE="$key"
-  generate_summary          # mark this phase "running" before it starts
-  "$body_fn"
-  CURRENT_PHASE=""
-  checkpoint_done "$key"
-  generate_summary          # mark it "done" (+ refresh live stats) right after
-  echo -e "${MAGENTA}[✓]${RESET} Checkpoint: $key"
-}
-
-# ─────────────────────────────────────────
 # DIRECTORIES
 # ─────────────────────────────────────────
-mkdir -p "$BASE"/{passive,active,dns,ports,web,js,js/downloaded,secrets,vulns,screenshots,whois,headers,techfp,asn,dirbrute,params,cloud,vulnhelpers,report}
+mkdir -p "$BASE"/{passive,active,dns,ports,web,js,js/downloaded,secrets,vulns,screenshots,whois,headers,techfp,asn,dirbrute,params,cloud,vulnhelpers,report,logs}
 cd "$BASE" || exit 1
 
 START_TIME=$(date +%s)
@@ -658,14 +696,30 @@ fi
 echo "$domain" > .target
 date -u > .start_time
 [ -n "$SCOPE_FILE" ] && info "Scope: $SCOPE_FILE" || info "No scope file — all subdomains in scope"
+
+# ── Scope init, done ONCE here, eagerly, in the main process ──
+# _init_scope()'s own "run once" guard (_scope_init_done) is a plain shell
+# variable, which no longer provides real memoization now that phases run
+# as forked subshells: phase_passive and phase_resolve (the only two
+# apply_scope callers) each get their OWN copy of that variable, so lazy
+# per-phase init would silently re-parse the Burp scope file and re-print
+# scope_summary() in two separate phase logs instead of once. Since
+# SCOPE_FILE is fixed for the whole run, initializing it here — before any
+# phase subshell forks — means every phase inherits the already-parsed
+# scope state for free, with the summary printed once, up front.
+_init_scope
+
 info "Rate limit: ${RATE_LIMIT} req/s | Output: $(pwd)"
 [ -n "$PORT_TARGET" ] && info "Single port-scan target (-u/--url): $PORT_TARGET"
 [ "$JSON_OUTPUT" = true ] && info "Live summary.json enabled — dashboard can poll this directory"
 
 # ─────────────────────────────────────────
 # PHASE PLAN DISPLAY
+# Numbers below reflect the original phase numbering for readability only —
+# actual execution order is determined by the dependency-graph scheduler
+# further down, not this list. See --status for live progress once running.
 # ─────────────────────────────────────────
-echo -e "${BOLD}Phase plan:${RESET}"
+echo -e "${BOLD}Phase plan (numbers are labels only — real order is dependency-driven):${RESET}"
 declare -A PHASE_FLAGS=(
   [whois]="$RUN_WHOIS"    [passive]="$RUN_PASSIVE"  [dns]="$RUN_DNS"
   [mutation]="$RUN_MUTATION" [resolve]="$RUN_RESOLVE" [httpx]="$RUN_HTTPX"
@@ -988,7 +1042,11 @@ phase_ports() {
 phase_js() {
   local GAU_TMPDIR
   GAU_TMPDIR=$(mktemp -d)
-  CLEANUP_TMPDIRS+=("$GAU_TMPDIR")
+  # This function now runs inside its own detached scheduler subshell, so
+  # appending to the parent's CLEANUP_TMPDIRS array wouldn't be visible
+  # outside that subshell. Use a local EXIT trap instead — it fires on
+  # normal completion AND on SIGTERM forwarded by the scheduler's cleanup().
+  trap 'rm -rf "$GAU_TMPDIR"' EXIT
 
   local GAU_CONCURRENCY=10 GAU_JOBS=0
   while IFS= read -r url; do
@@ -1003,8 +1061,7 @@ phase_js() {
   wait
 
   cat "${GAU_TMPDIR}"/*.txt 2>/dev/null | sort -u > js/gau_all_urls.txt || touch js/gau_all_urls.txt
-  rm -rf "$GAU_TMPDIR"
-  CLEANUP_TMPDIRS=("${CLEANUP_TMPDIRS[@]/$GAU_TMPDIR}")
+  # GAU_TMPDIR removal now happens via the EXIT trap set above.
 
   katana -list web/live_urls.txt -jc -d 3 -silent -c 10 -p 10 \
     -rl "$RATE_LIMIT" -o js/katana_all_urls.txt 2>/dev/null || touch js/katana_all_urls.txt
@@ -1719,31 +1776,195 @@ phase_vulnhelper() {
 }
 
 # ════════════════════════════════════════════════════════════
-# EXECUTE PHASES
+# EXECUTE PHASES — DEPENDENCY-GRAPH SCHEDULER
+#
+# Unlike the old linear run_phase calls, phases here declare what they
+# actually read from disk (DEPS below) and the scheduler launches each
+# one the moment every dependency is done/skipped — no artificial
+# phase-by-phase barrier. Up to $MAX_PARALLEL_PHASES run at once.
+#
+# A phase that is itself skipped (flag off, or --resume + already
+# checkpointed) resolves instantly, so it never blocks a downstream
+# phase that merely declares a dependency on it.
 # ════════════════════════════════════════════════════════════
-run_phase "whois"       "PHASE 1  — WHOIS & IP INTEL"                    "$RUN_WHOIS"       phase_whois
-run_phase "passive"     "PHASE 2  — PASSIVE SUBDOMAIN ENUMERATION"       "$RUN_PASSIVE"     phase_passive
-run_phase "dns"         "PHASE 3  — DNS DEEP DIVE"                       "$RUN_DNS"         phase_dns
-run_phase "mutation"    "PHASE 4  — MUTATION (--mutate to enable)"       "$RUN_MUTATION"    phase_mutation
-run_phase "resolve"     "PHASE 5  — ACTIVE RESOLUTION"                   "$RUN_RESOLVE"     phase_resolve
-run_phase "httpx"       "PHASE 6  — LIVE HOST DETECTION"                 "$RUN_HTTPX"       phase_httpx
-run_phase "waf"         "PHASE 7  — WAF DETECTION"                       "$RUN_WAF"         phase_waf
-run_phase "ports"       "PHASE 8  — PORT SCANNING"                       "$RUN_PORTS"       phase_ports
-run_phase "js"          "PHASE 9  — JS & ENDPOINT DISCOVERY"             "$RUN_JS"          phase_js
-run_phase "jsdeep"      "PHASE 9b — JS DEEP ANALYSIS"                    "$RUN_JSDEEP"      phase_jsdeep
-run_phase "secrets"     "PHASE 10 — SECRET SCANNING"                     "$RUN_SECRETS"     phase_secrets
-run_phase "takeover"    "PHASE 11 — SUBDOMAIN TAKEOVER"                  "$RUN_TAKEOVER"    phase_takeover
-run_phase "nuclei"      "PHASE 12 — VULNERABILITY SCANNING"              "$RUN_NUCLEI"      phase_nuclei
-run_phase "screenshots" "PHASE 13 — SCREENSHOTS"                         "$RUN_SCREENSHOTS" phase_screenshots
-run_phase "headers"     "PHASE 14 — CORS & SECURITY HEADER AUDIT"        "$RUN_HEADERS"     phase_headers
-run_phase "techfp"      "PHASE 15 — TECH FINGERPRINTING"                 "$RUN_TECHFP"      phase_techfp
-run_phase "favicon"     "PHASE 16 — FAVICON HASH HUNT"                   "$RUN_FAVICON"     phase_favicon
-run_phase "asn"         "PHASE 17 — ASN & NETWORK INTEL"                 "$RUN_ASN"         phase_asn
-run_phase "dirbrute"    "PHASE 18 — CONTENT DISCOVERY"                   "$RUN_DIRBRUTE"    phase_dirbrute
-run_phase "bypass403"   "PHASE 18b — 403 BYPASS + PATH MERGE"            "$RUN_403BYPASS"   phase_403bypass
-run_phase "params"      "PHASE 19 — PARAMETER ENUMERATION"               "$RUN_PARAMS"      phase_params
-run_phase "cloud"       "PHASE 20 — CLOUD ENUMERATION"                   "$RUN_CLOUD"       phase_cloud
-run_phase "vulnhelper"  "PHASE 21 — VULNERABILITY HELPERS"               "$RUN_VULNHELPER"  phase_vulnhelper
+
+declare -A LABELS=(
+  [whois]="PHASE 1  — WHOIS & IP INTEL"
+  [passive]="PHASE 2  — PASSIVE SUBDOMAIN ENUMERATION"
+  [dns]="PHASE 3  — DNS DEEP DIVE"
+  [mutation]="PHASE 4  — MUTATION (--mutate to enable)"
+  [resolve]="PHASE 5  — ACTIVE RESOLUTION"
+  [httpx]="PHASE 6  — LIVE HOST DETECTION"
+  [waf]="PHASE 7  — WAF DETECTION"
+  [ports]="PHASE 8  — PORT SCANNING"
+  [js]="PHASE 9  — JS & ENDPOINT DISCOVERY"
+  [jsdeep]="PHASE 9b — JS DEEP ANALYSIS"
+  [secrets]="PHASE 10 — SECRET SCANNING"
+  [takeover]="PHASE 11 — SUBDOMAIN TAKEOVER"
+  [nuclei]="PHASE 12 — VULNERABILITY SCANNING"
+  [screenshots]="PHASE 13 — SCREENSHOTS"
+  [headers]="PHASE 14 — CORS & SECURITY HEADER AUDIT"
+  [techfp]="PHASE 15 — TECH FINGERPRINTING"
+  [favicon]="PHASE 16 — FAVICON HASH HUNT"
+  [asn]="PHASE 17 — ASN & NETWORK INTEL"
+  [dirbrute]="PHASE 18 — CONTENT DISCOVERY"
+  [bypass403]="PHASE 18b — 403 BYPASS + PATH MERGE"
+  [params]="PHASE 19 — PARAMETER ENUMERATION"
+  [cloud]="PHASE 20 — CLOUD ENUMERATION"
+  [vulnhelper]="PHASE 21 — VULNERABILITY HELPERS"
+)
+
+declare -A RUN_FLAGS=(
+  [whois]="$RUN_WHOIS"       [passive]="$RUN_PASSIVE"     [dns]="$RUN_DNS"
+  [mutation]="$RUN_MUTATION" [resolve]="$RUN_RESOLVE"     [httpx]="$RUN_HTTPX"
+  [waf]="$RUN_WAF"           [ports]="$RUN_PORTS"         [js]="$RUN_JS"
+  [jsdeep]="$RUN_JSDEEP"     [secrets]="$RUN_SECRETS"     [takeover]="$RUN_TAKEOVER"
+  [nuclei]="$RUN_NUCLEI"     [screenshots]="$RUN_SCREENSHOTS" [headers]="$RUN_HEADERS"
+  [techfp]="$RUN_TECHFP"     [favicon]="$RUN_FAVICON"     [asn]="$RUN_ASN"
+  [dirbrute]="$RUN_DIRBRUTE" [bypass403]="$RUN_403BYPASS" [params]="$RUN_PARAMS"
+  [cloud]="$RUN_CLOUD"       [vulnhelper]="$RUN_VULNHELPER"
+)
+
+declare -A BODY_FNS=(
+  [whois]=phase_whois             [passive]=phase_passive       [dns]=phase_dns
+  [mutation]=phase_mutation       [resolve]=phase_resolve       [httpx]=phase_httpx
+  [waf]=phase_waf                 [ports]=phase_ports           [js]=phase_js
+  [jsdeep]=phase_jsdeep           [secrets]=phase_secrets       [takeover]=phase_takeover
+  [nuclei]=phase_nuclei           [screenshots]=phase_screenshots [headers]=phase_headers
+  [techfp]=phase_techfp           [favicon]=phase_favicon       [asn]=phase_asn
+  [dirbrute]=phase_dirbrute       [bypass403]=phase_403bypass   [params]=phase_params
+  [cloud]=phase_cloud             [vulnhelper]=phase_vulnhelper
+)
+
+# ── Dependency graph — only hard, file-level data dependencies ──
+# A phase that is skipped (RUN_*=false, or already checkpointed under
+# --resume) resolves to "skipped" immediately, so it satisfies any
+# downstream dependency without costing real time.
+declare -A DEPS=(
+  [whois]=""                  [passive]=""                 [cloud]=""
+  [dns]="whois"                [asn]="whois"
+  [mutation]="passive"
+  [resolve]="passive"          # mutation added conditionally below
+  [httpx]="resolve"
+  [waf]="httpx"                [ports]="resolve httpx"
+  [js]="httpx"
+  [jsdeep]="js"                [secrets]="js"
+  [takeover]="resolve"
+  [nuclei]="httpx"             # jsdeep added conditionally below (--deep-nuclei)
+  [screenshots]="httpx"        [headers]="httpx"
+  [techfp]="httpx"             [favicon]="httpx"
+  [dirbrute]="httpx"
+  [bypass403]="dirbrute"
+  [params]="js"                [vulnhelper]="js"
+)
+
+# Mutation only actually runs when --mutate is passed; when it does,
+# resolve must wait for it since it reads active/mutated.txt.
+[ "$RUN_MUTATION" = true ] && DEPS[resolve]="passive mutation"
+
+# nuclei's deep pass reads js/js_sensitive_endpoints.txt, produced by
+# jsdeep. Only wire that dependency in when --deep-nuclei is actually on,
+# so a basic nuclei pass isn't needlessly held up behind JS analysis.
+[ "$DEEP_NUCLEI" = true ] && DEPS[nuclei]="httpx jsdeep"
+
+ALL_PHASE_KEYS=("${PHASE_KEYS[@]}")
+for k in "${ALL_PHASE_KEYS[@]}"; do STATUS[$k]="pending"; done
+
+info "Dependency-graph scheduler: max ${MAX_PARALLEL_PHASES} phases concurrently. Per-phase output → logs/<phase>.log"
+echo ""
+
+is_ready() {
+  local k="$1" d
+  for d in ${DEPS[$k]}; do
+    case "${STATUS[$d]:-pending}" in
+      done|skipped|failed) ;;   # dependency satisfied (failed still unblocks — see note below)
+      *) return 1 ;;
+    esac
+  done
+  return 0
+}
+
+launch_phase() {
+  local k="$1"
+  if [ "$RESUME_MODE" = true ] && checkpoint_check "$k"; then
+    STATUS[$k]="skipped"
+    resumed "${LABELS[$k]}"
+    return
+  fi
+  if [ "${RUN_FLAGS[$k]}" = false ]; then
+    STATUS[$k]="skipped"
+    skip "${LABELS[$k]}"
+    return
+  fi
+  STATUS[$k]="running"
+  echo -e "${GREEN}[▶ START]${RESET} ${LABELS[$k]}  (log: logs/${k}.log)"
+  (
+    exec > "logs/${k}.log" 2>&1
+    banner "${LABELS[$k]}"
+    "${BODY_FNS[$k]}"
+  ) &
+  local pid=$!
+  PIDS[$k]=$pid
+  PID_KEY[$pid]=$k
+}
+
+# ── Main scheduler loop ──
+# Each iteration: (1) launch every ready, not-yet-started phase up to the
+# concurrency cap, (2) block on `wait -n` for the next one to finish,
+# (3) reap ALL now-finished PIDs (more than one can finish between
+# iterations), updating STATUS/checkpoint/summary.json for each.
+while :; do
+  for k in "${ALL_PHASE_KEYS[@]}"; do
+    [ "${STATUS[$k]}" = "pending" ] || continue
+    is_ready "$k" || continue
+    [ "${#PIDS[@]}" -ge "$MAX_PARALLEL_PHASES" ] && break
+    launch_phase "$k"
+  done
+
+  if [ "${#PIDS[@]}" -eq 0 ]; then
+    any_pending=false
+    for k in "${ALL_PHASE_KEYS[@]}"; do
+      [ "${STATUS[$k]}" = "pending" ] && any_pending=true
+    done
+    [ "$any_pending" = false ] && break
+    # Nothing running, something pending, nothing became ready this
+    # pass — only possible if DEPS has a typo'd/cyclic edge. Surface it
+    # clearly instead of spinning forever.
+    error "Scheduler stalled — pending phase(s) with unmet dependencies:"
+    for k in "${ALL_PHASE_KEYS[@]}"; do
+      [ "${STATUS[$k]}" = "pending" ] && error "  $k  (deps: ${DEPS[$k]:-none})"
+    done
+    break
+  fi
+
+  set +e
+  wait -n 2>/dev/null
+  set -e
+
+  for pid in "${!PID_KEY[@]}"; do
+    kill -0 "$pid" 2>/dev/null && continue   # still running
+    set +e
+    wait "$pid" 2>/dev/null
+    rc=$?
+    set -e
+    k="${PID_KEY[$pid]}"
+    unset "PID_KEY[$pid]"
+    unset "PIDS[$k]"
+    if [ "$rc" -eq 0 ]; then
+      STATUS[$k]="done"
+      checkpoint_done "$k"
+      success "Finished: ${LABELS[$k]}"
+    else
+      STATUS[$k]="failed"
+      # Deliberately still unblocks dependents: every phase body already
+      # falls back to empty files on individual tool failure (|| touch ...),
+      # so downstream phases can proceed against partial/empty input rather
+      # than stalling the whole graph. Check logs/<k>.log for the cause.
+      failed "${LABELS[$k]} (exit $rc) — see logs/${k}.log"
+    fi
+    generate_summary
+  done
+done
 
 # ── JSON + Report ──
 info "Generating reports..."
