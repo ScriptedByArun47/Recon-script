@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ============================================================
-# PENTURION v7 — Automated Web Recon Framework
-# Usage: ./penturion.sh target.com [OPTIONS]
+# Recon-tool v7 — Automated Web Recon Framework 
+# Usage: ./recon-tool.sh target.com [OPTIONS]
 #
 # RESUME / CHECKPOINT:
 #   --resume            Continue from last completed phase
@@ -73,15 +73,15 @@
 #   FFUF_RATE             ffuf req/s (default: 200)
 #
 # EXAMPLES:
-#   ./penturion.sh target.com
-#   ./penturion.sh target.com --resume
-#   ./penturion.sh target.com --scope scope.txt --rate-limit 30
-#   ./penturion.sh target.com --mutate --json
-#   ./penturion.sh target.com --only-dirbrute --only-params
-#   ./penturion.sh target.com --skip-nmap --skip-amass --skip-mutation
-#   ./penturion.sh target.com --only-ports -u sub.target.com
-#   ./penturion.sh target.com --deep-nuclei
-#   ./penturion.sh --install-deps
+#   ./recon-tool.sh target.com
+#   ./recon-tool.sh target.com --resume
+#   ./recon-tool.sh target.com --scope scope.txt --rate-limit 30
+#   ./recon-tool.sh target.com --mutate --json
+#   ./recon-tool.sh target.com --only-dirbrute --only-params
+#   ./recon-tool.sh target.com --skip-nmap --skip-amass --skip-mutation
+#   ./recon-tool.sh target.com --only-ports -u sub.target.com
+#   ./recon-tool.sh target.com --deep-nuclei
+#   ./recon-tool.sh --install-deps
 # ============================================================
 
 set -euo pipefail
